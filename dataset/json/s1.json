@@ -1,0 +1,30 @@
+{
+  "global_style": {
+      "visual_style": "anime",
+      "color_mode": "high contrast",
+      "line_weight": "thin and sharp",
+      "lighting": "top-down soft light",
+      "camera": "medium shot, eye-level",
+      "mood": "serious"
+  },
+  "scene": [
+  {
+    "id": 0,
+    "description": "A black canvas with an aspect ratio of 3.91. It fills the entire image and contains a red rectangle and a white arrow inside.",
+    "mask_path": "mask_0.png",
+    "parent": -1
+
+  },
+  {
+    "id": 1,
+    "description": "A red rectangle",
+    "mask_path": "mask_1.png",
+    "parent": 0
+  },
+  {
+    "id": 2,
+    "description": "A white arrow",
+    "mask_path": "mask_2.png",
+    "parent": 1
+  }
+]}

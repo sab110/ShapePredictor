@@ -1,0 +1,84 @@
+{
+  "global_style": {
+      "visual_style": "anime",
+      "color_mode": "high contrast",
+      "line_weight": "thin and sharp",
+      "lighting": "top-down soft light",
+      "camera": "medium shot, eye-level",
+      "mood": "serious"
+  },
+  "scene": [
+  
+  {
+    "id": 0,
+    "description": "A orange canvas with an aspect ratio of 0.56. It contains a pink speech bubble and a blue arrow.",
+    "parent": -1,
+    "mask_path": "mask_0.png",
+    "bbox": [
+      0,
+      0,
+      387,
+      686
+    ],
+    "toTheLeft": [],
+    "toTheRight": [],
+    "above": [],
+    "below": [],
+    "touching": [],
+    "position": null
+  },
+  {
+    "id": 1,
+    "description": "A pink speach bubble with a heart inside",
+    "parent": 0,
+    "mask_path": "mask_1.png",
+    "bbox": [
+      72,
+      151,
+      238,
+      233
+    ],
+    "toTheLeft": [],
+    "toTheRight": [],
+    "above": [],
+    "below": [],
+    "touching": [],
+    "position": "c"
+  },
+  {
+    "id": 2,
+    "description": "A purple heart",
+    "parent": 1,
+    "mask_path": "mask_2.png",
+    "bbox": [
+      120,
+      165,
+      43,
+      205
+    ],
+    "toTheLeft": [],
+    "toTheRight": [],
+    "above": [],
+    "below": [],
+    "touching": [],
+    "position": "l"
+  },
+  {
+    "id": 3,
+    "description": "A blue arrow",
+    "parent": 0,
+    "mask_path": "mask_3.png",
+    "bbox": [
+      82,
+      429,
+      232,
+      181
+    ],
+    "toTheLeft": [],
+    "toTheRight": [],
+    "above": [2],
+    "below": [],
+    "touching": [],
+    "position": "b"
+  }
+]}
