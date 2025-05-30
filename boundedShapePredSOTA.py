@@ -16,7 +16,7 @@ from contour import mask_to_bezier_sequence, mask_to_vertex_sequence
 import matplotlib.path as mpath # <<< NEW IMPORT
 from torch.nn.utils.rnn import pad_sequence
 # Ensure transformers is installed: pip install transformers
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel,AutoTokenizer, T5EncoderModel
 import functools
 import torch.nn.functional as F
 from matplotlib.patches import Polygon as MplPolygon # Renamed to avoid clash
@@ -24,9 +24,16 @@ from matplotlib.patches import Polygon as MplPolygon # Renamed to avoid clash
 from scipy.interpolate import splprep, splev
 # Ensure shapely is installed: pip install Shapely
 from shapely.geometry import Point, Polygon as ShapelyPolygon
-from typing import Optional, List, Dict,Tuple # Kept Dict for return type hint
+from typing import Optional, List, Dict,Tuple, Union # Kept Dict for return type hint
 import traceback
 import math
+import os
+import json
+from typing import Optional
+from torch.utils.data import Dataset
+import torch
+
+
 NUM_INTERIOR_POINTS = 256
 CURVE_PARAMS = 6  # [cx1, cy1, cx2, cy2, ex, ey] - Model Output Format
 
@@ -34,7 +41,7 @@ import numpy as np
 import math
 
 def generate_deterministic_context_points(
-    parent_verts_scaled: np.ndarray | None,
+    parent_verts_scaled: Union[np.ndarray, None],
     parent_bin:          np.ndarray,
     N_total:             int,
     N_boundary:          int,
@@ -116,7 +123,7 @@ def generate_deterministic_context_points(
 
 # --- GPU function ---
 def generate_deterministic_context_points_gpu(
-    parent_verts_scaled: torch.Tensor | None,
+    parent_verts_scaled: Union[torch.Tensor, None],
     parent_bin:          torch.Tensor,
     N_total:             int,
     N_boundary:          int,
@@ -332,19 +339,6 @@ def save_visualization(pts, mismatches, mask_path, out_path="mask_sampling_debug
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Saved visualization to {out_path}")
-import os
-import json
-from typing import Optional
-
-import cv2
-import numpy as np
-from PIL import Image
-from torch.utils.data import Dataset
-import torch
-from tqdm import tqdm
-
-from contour import mask_to_bezier_sequence
-from transformers import AutoTokenizer, T5EncoderModel
 
 
 class AugmentedDataset(Dataset):
@@ -620,8 +614,13 @@ class ShapePredictor(nn.Module):
         self.num_segments = num_segments
         self.d_model = d_model
 
-        # Revert query_embed to standard initialization (important for PE)
-        self.query_embed = nn.Parameter(torch.randn(num_segments, d_model))
+        # Better initialization for query embeddings to ensure diversity
+        self.query_embed = nn.Parameter(torch.randn(num_segments, d_model) * 0.1)
+        # Initialize with different patterns for each query
+        with torch.no_grad():
+            for i in range(num_segments):
+                # Add some structured variation to each query
+                self.query_embed[i] += torch.sin(torch.arange(d_model, dtype=torch.float) * (i + 1) * 0.1)
 
         self.positional_encoder = PositionalEncoding(d_model, dropout, max_len=num_segments)
 
@@ -638,42 +637,27 @@ class ShapePredictor(nn.Module):
             norm=nn.LayerNorm(d_model)
         )
 
-        # Output head with SquareActivation
+        # Output head with better initialization
         self.output_head = nn.Sequential(
             nn.Linear(d_model, d_model),  # L1
             nn.ReLU(),
             nn.Linear(d_model, out_dim),   # L2
             nn.Sigmoid()
         )
-        # Optional: Initialize bias of L1 if needed, but square activation is less prone to "dying"
-        # if hasattr(self.output_head[0], 'bias') and self.output_head[0].bias is not None:
-        #     nn.init.constant_(self.output_head[0].bias.data, 0.0) # Or small positive
-
-        # Optional: If after SquareActivation, L2 still produces small variance,
-        # you could apply the custom weight initialization to self.output_head[2] discussed before.
-        # However, SquareActivation might make this unnecessary by providing larger variance input to L2.
-
-
+        
+        # Better initialization for the output layers
+        with torch.no_grad():
+            # Initialize the final layer with smaller weights to avoid saturation
+            nn.init.xavier_uniform_(self.output_head[2].weight, gain=0.1)
+            if self.output_head[2].bias is not None:
+                nn.init.constant_(self.output_head[2].bias, 0.5)  # Start near middle of sigmoid range
 
     def forward(self, H_memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = H_memory.size(0)
         content_queries = self.query_embed.unsqueeze(0).expand(B, -1, -1)
         tgt = self.positional_encoder(content_queries)
-        print("tgt mean:", tgt.mean().item(), "std:", tgt.std().item())  # Debugging line
         decoded_hidden_states = self.decoder(tgt=tgt, memory=H_memory)
-        print("decoded_hidden_states mean:", decoded_hidden_states.mean().item(), "std:", decoded_hidden_states.std().item())  # Debugging line
-        # DEBUG: Check scale
-        # print(f"decoded_hidden_states mean: {decoded_hidden_states.mean().item():.4f}, std: {decoded_hidden_states.std().item():.4f}")
-        # L1_output = self.output_head[0](decoded_hidden_states)
-        # print(f"L1_output (before Square) mean: {L1_output.mean().item():.4f}, std: {L1_output.std().item():.4f}")
-        # Square_output = self.output_head[1](L1_output)
-        # print(f"Square_output mean: {Square_output.mean().item():.4f}, std: {Square_output.std().item():.4f}")
-
         coords = self.output_head(decoded_hidden_states)
-        # Your existing print for final coords before sigmoid:
-        end_coords = coords[..., 5:6]
-        print("coords mean:", end_coords.mean().item(), "std:", end_coords.std().item()) 
-        
         return coords, decoded_hidden_states
 
 class SimpleShapeEncoder(nn.Module): # Parent Shape Encoder
@@ -687,7 +671,6 @@ class SimpleShapeEncoder(nn.Module): # Parent Shape Encoder
             nn.ReLU(),
             nn.Linear(dim, dim)
         )
-        # self.pool = nn.AdaptiveAvgPool1d(1) # We will do masked mean manually
         self.to_latent = nn.Linear(dim, dim)
 
     def forward(self, shape_pts: torch.Tensor) -> torch.Tensor:
@@ -902,7 +885,7 @@ class PolygonPredictor(nn.Module):
 
         if mask_after_stop_2D.any():
             final_pred_coords[mask_after_stop_2D] = -1.0
-        # print(f"Final pred coords shape: {final_pred_coords}, ")
+        
         return {
             "segments": final_pred_coords,
             "type_logits": decoder_outputs["types_logits"],
@@ -911,111 +894,17 @@ class PolygonPredictor(nn.Module):
         }
 
 
-import torch
-import torch.nn.functional as F
-
-# def train_batch_shape_only(
-#     model,
-#     batch,
-#     optimizer,
-#     device,
-#     batch_idx,
-#     lambda_shape: float = 20000.0,
-#     debug_mode:   bool  = True,
-# ):
-#     """
-#     A variant of train_batch that ignores all losses except the shape (sampled Bézier) loss.
-#     """
-#     # 1) Move batch to device
-#     child_embs   = batch['child_embs'].to(device)           # [B, E]
-#     parent_embs  = batch['parent_embs'].to(device)          # [B, E]
-#     parent_bbox  = batch['parent_bbox'].to(device)          # [B,4,2]
-#     parent_segs  = batch['parent_bezier_segs'].to(device)   # [B, T_par, 6]
-#     gt_curves    = batch['gt_curves'].to(device)            # [B, T_gt, 6]
-#     lengths      = batch['lengths'].to(device)              # [B]
-#     B            = gt_curves.size(0)
-
-#     # 2) Forward pass (no teacher forcing)
-#     outputs = model(
-#         child_embs,
-#         parent_embs,
-#         parent_bbox,
-#         parent_segs,
-#         teacher_forcing=False,
-#         gt_curves=gt_curves
-#     )
-#     pred = outputs['segments']  # [B, T_pred, 6]
-
-#     # 3) Align time-steps
-#     T_pred = pred.size(1)
-#     T_gt   = gt_curves.size(1)
-#     T      = min(T_pred, T_gt)
-#     pred   = pred[:, :T, :]     # [B, T, 6]
-#     gt     = gt_curves[:, :T, :] # [B, T, 6]
-
-#     # 4) Build valid time‐mask [B, T]
-#     valid_mask = (torch.arange(T, device=device)[None, :] < lengths[:, None]).float()
-
-#     # 5) Sample Bézier points (auto‐detect type via -1 in controls)
-#     def sample_bezier_batch(starts, curves, steps=50):
-#         B_, T_ = starts.shape[:2]
-#         t      = torch.linspace(0,1,steps,device=device).view(1,1,steps,1)
-#         p0     = starts.view(B_,T_,1,2)
-#         p1     = curves[...,0:2].view(B_,T_,1,2)
-#         p2     = curves[...,2:4].view(B_,T_,1,2)
-#         p3     = curves[...,4:6].view(B_,T_,1,2)
-#         line   = (1-t)*p0    + t*p3
-#         quad   = (1-t)**2*p0 + 2*(1-t)*t*p2 + t**2*p3
-#         cubic  = (1-t)**3*p0 + 3*(1-t)**2*t*p1 + 3*(1-t)*t**2*p2 + t**3*p3
-#         m1     = (curves[...,0:2]<0).all(dim=-1).view(B_,T_,1,1)
-#         m2     = (curves[...,2:4]<0).all(dim=-1).view(B_,T_,1,1)
-#         return torch.where(m1&m2, line, torch.where(m1, quad, cubic))
-
-#     # 6) Compute start‐points for sampling
-#     gt_ends   = gt[..., 4:6]
-#     pred_ends = pred[..., 4:6]
-#     gt_st     = torch.roll(gt_ends,   shifts=1, dims=1)
-#     gt_st[:,0,:] = gt_ends[:,-1,:]
-#     pd_st     = torch.roll(pred_ends, shifts=1, dims=1)
-#     pd_st[:,0,:] = pred_ends[:,-1,:]
-
-#     gt_samp = sample_bezier_batch(gt_st, gt)    # [B, T, steps, 2]
-#     pd_samp = sample_bezier_batch(pd_st, pred)
-
-#     # 7) Expand valid_mask to [B, T, steps, 2]
-#     vm = valid_mask[:, :, None, None] \
-#          .expand(-1, -1, pd_samp.size(2), pd_samp.size(3)) \
-#          .bool()
-
-#     # 8) Shape loss only
-#     loss_shape = lambda_shape * F.mse_loss(
-#         pd_samp[vm],
-#         gt_samp[vm],
-#         reduction='mean'
-#     )
-
-#     # 9) Backprop & step
-#     optimizer.zero_grad()
-#     loss_shape.backward()
-#     optimizer.step()
-
-#     if debug_mode:
-#         print(f"[Batch {batch_idx}] shape={loss_shape:.3f}")
-
-#     return loss_shape.item()
-
 def train_batch(
     model,
     batch,
     optimizer,
     device,
     batch_idx, # For printing progress
-    lambda_curve: float = 2000.0,
+    lambda_curve: float = 500.0,  # Reduced from 2000
     lambda_stop:  float = 10.0,
     lambda_len:   float = 20.0, # Weight for the expected length loss
     lambda_type:  float = 100.0,
     debug_mode:   bool  = True,
-    # cfg: PolygonConfig = None, # If you need cfg.max_output_segments explicitly
 ):
     # Move batch to device and ensure lengths is float for calculations
     child_embs  = batch['child_embs'].to(device)
@@ -1029,15 +918,11 @@ def train_batch(
     if B == 0: # Handle empty batch if it can occur
         return 0.0
         
-    teacher_forcing = False # Standard for training autoregressive models
-    geom_scale = 50.0 if teacher_forcing else 10.0 # Scale for geometry loss
-    print(1111, child_embs.shape, parent_embs.shape, parent_bbox.shape, parent_segs.shape, gt_curves.shape, lengths.shape)
     # 1) Forward pass
     outputs = model(
         child_embs,
         parent_embs,
         parent_segs,
-        # padding_mask=batch.get('parent_padding_mask', None), # Pass if your model uses it
     )
     pred_segments = outputs['segments']     # Shape: [B, S, 6] (S = max_output_segments)
     pred_stops    = outputs['stop_scores']        # Shape: [B, S] (sigmoid probabilities)
@@ -1047,13 +932,9 @@ def train_batch(
     T_gt_dim = gt_curves.size(1)  # Padded length of ground truth curves in the batch
 
     # 2) Create valid_mask based on true lengths for segments that are actually present
-    # valid_mask[b, s] = 1 if segment s of sample b is a real segment (0-indexed), 0 otherwise.
-    # Max index for a real segment is lengths[b]-1.
     valid_mask = (torch.arange(S, device=device)[None, :] < lengths[:, None]).float()  # Shape: [B, S]
 
     # 3) Curve L1 loss
-    # Compare up to the minimum of predicted length (S) and ground truth padded length (T_gt_dim),
-    # then use valid_mask for actual elements.
     compare_len_curve = min(S, T_gt_dim)
     
     pred_for_curve = pred_segments[:, :compare_len_curve, :]    # [B, compare_len_curve, 6]
@@ -1062,12 +943,9 @@ def train_batch(
 
     err = (pred_for_curve - gt_for_curve).abs() * mask_for_curve.unsqueeze(-1)
     num_valid_coords = (mask_for_curve.sum() * 6).clamp(min=1e-9) # Avoid division by zero
-    loss_curve = lambda_curve * (err.sum() / num_valid_coords) * geom_scale
+    loss_curve = lambda_curve * (err.sum() / num_valid_coords)
 
     # 4) Stop-token loss (Binary Cross-Entropy)
-    # target_stop[b,s] = 1 if s >= (lengths[b]-1) (actual stop index), else 0.
-    # Meaning, stop signal should be 0 for segments before the last true segment,
-    # and 1 at the last true segment and for all subsequent potential segments.
     idxs_S = torch.arange(S, device=device)[None, :].expand(B, -1) # [B,S] tensor of [0,1,...,S-1]
     stop_idx_gt = (lengths - 1).clamp(min=0)[:, None] # [B,1], index of the last true segment.
     target_stop = (idxs_S >= stop_idx_gt).float()     # [B,S]
@@ -1075,12 +953,9 @@ def train_batch(
     weight_for_stop_loss = torch.where(target_stop > 0, 5.0, 1.0) # As in original
     loss_stop = lambda_stop * F.binary_cross_entropy(
         pred_stops, target_stop, weight=weight_for_stop_loss, reduction='mean'
-    ) * geom_scale
+    )
 
-    # 5) Expected Length Loss (New count loss)
-    # E[L] = sum_{k=0}^{S-1} P(Length > k)
-    # P(Length > k) = P(Length >= k+1) = product_{i=0}^{k-1} (1 - pred_stops[:, i])
-    # where P(Length > 0) = 1.
+    # 5) Expected Length Loss
     prob_continue = 1.0 - pred_stops # Shape: [B, S]
 
     ones_for_batch_dim = torch.ones(B, 1, device=device)
@@ -1089,26 +964,16 @@ def train_batch(
     elif S == 1: # If max output is 1 segment
         expected_length = ones_for_batch_dim.squeeze(1) # Expected length is 1
     else:
-        # prob_continue_for_survival should be [1, (1-p0), (1-p1), ..., (1-p_{S-2})]
-        # These are the probabilities of *not* stopping before generating segment k+1.
         prob_continue_for_survival = torch.cat([ones_for_batch_dim, prob_continue[:, :-1]], dim=1) # Shape: [B, S]
         survival_probabilities = torch.cumprod(prob_continue_for_survival, dim=1) # Shape: [B, S]
-        # survival_probabilities[:, k] is P(Length > k segments) or P(Length >= k+1 segments)
         expected_length = torch.sum(survival_probabilities, dim=1) # Shape: [B]
     
-    loss_count = lambda_len * (expected_length - lengths).abs().mean() * geom_scale
+    loss_count = lambda_len * (expected_length - lengths).abs().mean()
 
     # 6) Type classification loss
-    # Uses valid_mask (Shape: [B,S]) to select only relevant logits and labels.
-    # type_logits is [B, S, 3].
-    print(f"Type logits shape: {type_logits.shape}, valid_mask shape: {valid_mask.shape}")
     type_logits_for_loss = type_logits[valid_mask.bool()] # Shape: [N_valid_total_segments, 3]
 
-    # Derive gt_types from gt_curves. gt_curves is [B, T_gt_dim, 6].
-    # We need ground truth types for all positions indicated by valid_mask.
-    # Max index in valid_mask is S-1. gt_curves might be shorter than S.
-    
-    # Determine the source length for gt_types based on T_gt_dim and S
+    # Derive gt_types from gt_curves
     gt_types_source_len = min(T_gt_dim, S)
     
     gt_c1 = gt_curves[:, :gt_types_source_len, :2]
@@ -1116,7 +981,6 @@ def train_batch(
 
     gt_line_mask_full  = (gt_c1 < 0).all(dim=-1) & (gt_c2 < 0).all(dim=-1)
     gt_quad_mask_full  = (gt_c1 < 0).all(dim=-1) & ~(gt_c2 < 0).all(dim=-1)
-    # Original cubic definition: gt_cubic = ~(gt_line | gt_quad)
     gt_cubic_mask_full = ~(gt_line_mask_full | gt_quad_mask_full) 
     
     gt_types_potential = torch.zeros((B, gt_types_source_len), dtype=torch.long, device=device)
@@ -1126,7 +990,6 @@ def train_batch(
     # Ensure gt_types_for_masking has dimension S to match valid_mask
     if gt_types_source_len < S:
         padding_shape = (B, S - gt_types_source_len)
-        # Pad with type 0 (line/default). These will be ignored if not in valid_mask.
         padding_types = torch.zeros(padding_shape, dtype=torch.long, device=device) 
         gt_types_for_masking = torch.cat([gt_types_potential, padding_types], dim=1)
     else:
@@ -1134,29 +997,21 @@ def train_batch(
 
     gt_types_for_loss = gt_types_for_masking[valid_mask.bool()] # Shape: [N_valid_total_segments]
 
-    if type_logits_for_loss.numel() > 0:
-        if type_logits_for_loss.size(0) == gt_types_for_loss.size(0):
-            loss_type = lambda_type * F.cross_entropy(type_logits_for_loss, gt_types_for_loss) * geom_scale
-        else:
-            print(f"Warning: Mismatch in elements for type loss. Logits: {type_logits_for_loss.size(0)}, Labels: {gt_types_for_loss.size(0)}. Setting type loss to 0.")
-            loss_type = torch.tensor(0.0, device=device, dtype=total_loss.dtype if 'total_loss' in locals() else torch.float32)
-    else: # No valid segments to compute type loss (e.g., all lengths are 0)
-        loss_type = torch.tensor(0.0, device=device, dtype=total_loss.dtype if 'total_loss' in locals() else torch.float32)
+    if type_logits_for_loss.numel() > 0 and type_logits_for_loss.size(0) == gt_types_for_loss.size(0):
+        loss_type = lambda_type * F.cross_entropy(type_logits_for_loss, gt_types_for_loss)
+    else:
+        loss_type = torch.tensor(0.0, device=device)
 
     # 7) Total loss & backward
     total_loss = loss_curve + loss_stop + loss_count + loss_type
     
     optimizer.zero_grad()
-    # If using mixed precision (torch.cuda.amp.autocast), scaler is needed:
-    # scaler.scale(total_loss).backward()
-    # scaler.step(optimizer)
-    # scaler.update()
     total_loss.backward()
-    # Optional: Gradient clipping
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # Gradient clipping to prevent exploding gradients
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
-    if debug_mode and (batch_idx % 10 == 0 or batch_idx < 5): # Print more often initially or for specific intervals
+    if debug_mode and (batch_idx % 10 == 0 or batch_idx < 5):
         print(
             f"[Batch {batch_idx}] "
             f"Total={total_loss.item():.3f} | "
@@ -1177,23 +1032,12 @@ def save_checkpoint(model, optimizer, epoch, current_best_loss, checkpoint_path)
    
     full_state_dict = unwrapped_model.state_dict()
    
-    # Filter out frozen T5 encoder parameters (this is what's taking 418MB!)
+    # Filter out frozen T5 encoder parameters
     filtered_state_dict = {
         k: v for k, v in full_state_dict.items()
         if not k.startswith("encoder.")  # Remove T5 encoder weights
            and not k.startswith("_orig_mod.encoder.")  # For compiled models
     }
-    
-    print(f"Original model size: {len(full_state_dict)} parameters")
-    print(f"Filtered model size: {len(filtered_state_dict)} parameters")
-    
-    # Calculate size reduction
-    original_params = sum(p.numel() for p in full_state_dict.values())
-    filtered_params = sum(p.numel() for p in filtered_state_dict.values())
-    original_size_mb = original_params * 4 / (1024 * 1024)
-    filtered_size_mb = filtered_params * 4 / (1024 * 1024)
-    
-    print(f"Size reduction: {original_size_mb:.1f} MB → {filtered_size_mb:.1f} MB")
     
     checkpoint = {
         "epoch": epoch,
@@ -1203,18 +1047,13 @@ def save_checkpoint(model, optimizer, epoch, current_best_loss, checkpoint_path)
     }
    
     torch.save(checkpoint, checkpoint_path)
-    
-    if os.path.exists(checkpoint_path):
-        file_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
-        print(f"Checkpoint saved to {checkpoint_path} ({file_size_mb:.2f} MB)")
-    else:
-        print(f"Error: Failed to save checkpoint to {checkpoint_path}")
+    print(f"Checkpoint saved to {checkpoint_path}")
     return checkpoint
 
 
 def train_model_batched(
     dataset_path,
-    model_name=None,# Checkpoint path to resume from
+    model_name=None,
     output_dir="bezier_checkpoints_overfit",
     num_epochs=100,
     learning_rate=9e-3,
@@ -1222,7 +1061,7 @@ def train_model_batched(
     max_samples=None,
     run_visualization=False,
 ):
-    import traceback # For detailed error in visualization
+    import traceback
 
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1236,235 +1075,87 @@ def train_model_batched(
         ds,
         batch_size=actual_batch_size,
         shuffle=True,
-        num_workers=0,      # <–– no subprocesses
-        pin_memory=False,   # if your CPU→GPU transfer is a bottleneck, try toggling
+        num_workers=0,
+        pin_memory=False,
         collate_fn=collate_fn
     )
 
-    # It's good practice to have model configuration in one place
-    # For now, using the hardcoded values as per your PolygonPredictor snippet
     cfg=PolygonConfig()
-    
-
-    model = PolygonPredictor(
-        cfg=cfg
-    ).to(device)
+    model = PolygonPredictor(cfg=cfg).to(device)
 
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate,betas=(0.9, 0.95),weight_decay=0.0
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.0
     )
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1) # Example: Add if needed
 
     start_epoch = 1
-    best_loss = float('inf') # Initialize to infinity for proper comparison
+    best_loss = float('inf')
 
     if model_name and os.path.exists(model_name):
         print(f"Resuming training from checkpoint: {model_name}")
         ckpt = torch.load(model_name, map_location=device)
         
-        # Determine if the model to load into was compiled
         model_to_load = model
-        if hasattr(model, "_orig_mod"): # If 'model' is already compiled
+        if hasattr(model, "_orig_mod"):
             model_to_load = model._orig_mod
 
-        # model_state_dict in ckpt is already filtered (custom weights only)
-        # load_state_dict with strict=False will load matching keys and ignore others (like CLIP)
         missing_keys, unexpected_keys = model_to_load.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if unexpected_keys:
-            print(f"Warning: Unexpected keys found in checkpoint's model_state_dict: {unexpected_keys}")
         
-        # Verify that essential custom parts were loaded (optional detailed check)
-        # custom_keys_not_loaded = [k for k in missing_keys if not (k.startswith("clip_model.") or k.startswith("_orig_mod.clip_model."))]
-        # if custom_keys_not_loaded:
-        #     print(f"Warning: Some custom model parameters were not found in the checkpoint or not loaded: {custom_keys_not_loaded}")
-
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             for state in optimizer.state.values():
                 for k_opt, v_opt in state.items():
                     if isinstance(v_opt, torch.Tensor):
                         state[k_opt] = v_opt.to(device)
-        else:
-            print("Warning: Optimizer state not found in checkpoint.")
 
         if "epoch" in ckpt:
             start_epoch = ckpt['epoch'] + 1
-            print(f"Resuming from epoch {start_epoch}")
-        else:
-            print("Warning: Epoch number not found in checkpoint. Starting from epoch 1.")
             
         if "best_loss" in ckpt:
             best_loss = ckpt['best_loss']
-            print(f"Resuming with best_loss: {best_loss:.6f}")
-        else:
-            print(f"Warning: best_loss not found in checkpoint. Initializing to infinity.")
-        
-        # if scheduler and "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"]:
-        #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        #     print("Resumed LR scheduler state.")
 
         print(f"LOADED checkpoint successfully.")
     else:
-        if model_name:
-            print(f"Warning: Checkpoint file '{model_name}' not found. Training from scratch.")
-        else:
-            print("No checkpoint specified. Training from scratch.")
-    # best_loss*=50
-    best_model_path = os.path.join(output_dir, "best_model.pth") # Unified best model name
-
-    torch.backends.cudnn.benchmark = True
-    if torch.__version__ >= "2.0.0": # torch.compile is stable in 2.0+
-        print("Attempting to compile model with torch.compile()...")
-        try:
-            # Important: If you compile, ensure saving/loading handles the _orig_mod attribute
-            # or load state_dict into the uncompiled model before compiling.
-            # The current loading logic tries to load into model_to_load (which would be uncompiled if 'model' isn't compiled yet).
-            # If 'model' is already compiled when loading, model_to_load = model._orig_mod is correct.
-            model = torch.compile(model)
-            print("Model compiled successfully.")
-        except Exception as e: # Catch broader exceptions as compile can fail for various reasons
-            print(f"Model compilation failed: {e}. Proceeding without compilation.")
-    
-    # scaler = GradScaler() # Initialize if using mixed precision
+        print("Training from scratch.")
+        
+    best_model_path = os.path.join(output_dir, "best_model.pth")
 
     print(f"Starting training from epoch {start_epoch} up to {num_epochs}.")
-    print(f"Batch size: {actual_batch_size}. Overfitting {N} samples if batch_size == N.")
+    print(f"Batch size: {actual_batch_size}. Training on {N} samples.")
 
     for epoch in range(start_epoch, num_epochs + 1):
-        with torch.cuda.amp.autocast():
-            model.train()
+        model.train()
         epoch_total_loss = 0.0
-        # Store individual losses for epoch average
-        epoch_losses_components = {"stop": 0.0, "se": 0.0, "curve": 0.0, "len": 0.0, "start": 0.0}
-        
 
         for batch_idx, batch_data in enumerate(loader):
-            # Assuming train_batch now returns a tuple of all loss components
-            # total_loss_item, stop_item, se_item, curve_item, len_item, start_item
             loss_value = train_batch(
-                model, batch_data, optimizer, device, batch_idx, # Pass current best_loss
+                model, batch_data, optimizer, device, batch_idx,
             )
-            
             epoch_total_loss += loss_value
-            
 
         avg_epoch_loss = epoch_total_loss / len(loader) if len(loader) > 0 else float('nan')
-        log_msg = f"Epoch {epoch:3d}/{num_epochs} — Total Loss: {avg_epoch_loss:.6f}"
-        for name, total_val in epoch_losses_components.items():
-            avg_comp_loss = total_val / len(loader) if len(loader) > 0 else float('nan')
-            log_msg += f" — {name}L: {avg_comp_loss:.4f}"
-        print(log_msg)
-
-        # if scheduler: scheduler.step()
+        print(f"Epoch {epoch:3d}/{num_epochs} — Total Loss: {avg_epoch_loss:.6f}")
 
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
-            # best_epoch_val = epoch # Track the epoch for the best model
             print(f"  → New best model at epoch {epoch}, loss {best_loss:.6f}")
             save_checkpoint(model, optimizer, epoch, best_loss, best_model_path)
 
-        if avg_epoch_loss < 1e-6: # Early stopping for overfit
+        if avg_epoch_loss < 1e-6:
             print(f"✨ Perfect overfit at epoch {epoch}!")
             break
-        
-        if torch.cuda.is_available():
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
 
     final_path = os.path.join(output_dir, "final_model.pth")
-    # Save final model using the epoch number of the last completed epoch and the overall best_loss found
     save_checkpoint(model, optimizer, num_epochs, best_loss, final_path) 
-    print(f"Saved final model custom weights to {final_path}")
-
-    # Load the best model for visualization
-    if os.path.exists(best_model_path):
-        print(f"Loading best model from {best_model_path} for visualization.")
-        best_ckpt = torch.load(best_model_path, map_location=device)
-        vis_epoch_num = best_ckpt.get('epoch', 'unknown') # Get epoch from best checkpoint
-
-        # Re-initialize model for visualization to avoid issues with compiled model state for visualization
-        # Use the same configuration used for training
-        vis_model = PolygonPredictor(
-            cfg=cfg
-        ).to(device)
-        
-        model_to_load_vis = vis_model
-        if hasattr(vis_model, "_orig_mod"): # Should not be compiled yet as it's fresh
-             model_to_load_vis = vis_model._orig_mod
-
-        model_to_load_vis.load_state_dict(best_ckpt["model_state_dict"], strict=False)
-        print(f"Best model (epoch {vis_epoch_num}) loaded for visualization.")
-
-        if run_visualization:
-            try:
-                visualize_predictions(
-                    model=vis_model, dataset=ds, device=device,
-                    output_dir=output_dir, epoch=f"best_e{vis_epoch_num}"
-                )
-                print(f"Visualizations saved under {output_dir}/vis_epoch_best_e{vis_epoch_num}")
-            except Exception as e:
-                print(f"Visualization failed: {e}")
-                traceback.print_exc()
-    else:
-        print(f"Best model checkpoint not found at {best_model_path}. Skipping visualization.")
+    print(f"Saved final model to {final_path}")
 
     return model
 
 
 # --- Visualization ---
-
-import os, random
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as MplPolygon # Ensure rename if needed
-
-# --- Visualization Helper Functions (Keep as before) ---
-def bezier_curve(p0, c1, c2, p1, n_points=20):
-    """Sample points along a single cubic Bezier segment."""
-    t = np.linspace(0, 1, n_points)[:, np.newaxis]
-    points = ( (1 - t)**3 * p0 +
-               3 * (1 - t)**2 * t * c1 +
-               3 * (1 - t) * t**2 * c2 +
-               t**3 * p1 )
-    return points # [n_points, 2]
-
-def render_bezier_sequence(curve_params_tensor: torch.Tensor, initial_p0: np.ndarray, n_samples_per_segment=15):
-    """
-    Renders a sequence of Bezier curves defined by [C1, C2, P_end].
-    """
-    if curve_params_tensor is None or curve_params_tensor.numel() == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    curve_params_np = curve_params_tensor.detach().cpu().numpy()
-    K = curve_params_np.shape[0]
-    all_rendered_points = []
-    # Ensure initial_p0 is float32 numpy array
-    current_p0 = np.array(initial_p0, dtype=np.float32).reshape(2)
-
-
-    for i in range(K):
-        c1 = curve_params_np[i, 0:2]
-        c2 = curve_params_np[i, 2:4]
-        p1 = curve_params_np[i, 4:6] # Endpoint for this segment
-        segment_points = bezier_curve(current_p0, c1, c2, p1, n_samples_per_segment)
-        # Add points excluding the first one for subsequent segments to avoid duplication
-        all_rendered_points.append(segment_points if i == 0 else segment_points[1:])
-        current_p0 = p1 # Update start point for the next segment
-
-    if not all_rendered_points:
-        return np.empty((0, 2), dtype=np.float32)
-
-    return np.concatenate(all_rendered_points, axis=0)
-import matplotlib.patches as patches
 def visualize_predictions(model, dataset, device, output_dir, epoch, max_vis=20):
-    """
-    Visualizes predicted vs. ground-truth Bézier sequences,
-    batching each sample to size=1 so it matches the model.
-    """
+    """Visualize predicted vs ground-truth shapes."""
     def render_segment(start_pt, seg, seg_type, steps=50):
-        # …your existing implementation…
         if seg_type == 0:
             end_pt = seg[-2:]
             return np.vstack([start_pt, end_pt])
@@ -1488,58 +1179,45 @@ def visualize_predictions(model, dataset, device, output_dir, epoch, max_vis=20)
     for i in indices:
         sample = dataset[i]
         try:
-            # — batchify each field —
-            ce = sample['child_embs'].unsqueeze(0).to(device)           # [1, seq_len, d]
-            pe = sample['parent_embs'].unsqueeze(0).to(device)          # [1, seq_len, d]
-            bb = sample['parent_bbox'].unsqueeze(0).to(device)          # [1,4,2]
-            pseg = sample['parent_bezier_segs'].unsqueeze(0).to(device)# [1,T,6]
-            gt   = sample['gt_curves']                                  # [T_gt,6]
+            # Batchify each field
+            ce = sample['child_embs'].unsqueeze(0).to(device)
+            pe = sample['parent_embs'].unsqueeze(0).to(device)
+            bb = sample['parent_bbox'].unsqueeze(0).to(device)
+            pseg = sample['parent_bezier_segs'].unsqueeze(0).to(device)
+            gt   = sample['gt_curves']
 
-            # draw bbox rectangle in normalized coords
-            bb0 = bb[0].cpu().numpy()
-            xmin, ymin = bb0[:,0].min(), bb0[:,1].min()
-            width, height = bb0[:,0].ptp(), bb0[:,1].ptp()
-            rect = patches.Rectangle(
-                (xmin, ymin),
-                width, height,
-                linewidth=1, edgecolor='gray',
-                facecolor='none', linestyle='--'
-            )
-
-            # model forward
+            # Model forward
             with torch.no_grad():
-                out = model(
-                    ce, pe, pseg
-                )
+                out = model(ce, pe, pseg)
 
-            pred_segs  = out['segments'][0].cpu().numpy()    # [T,6]
+            pred_segs  = out['segments'][0].cpu().numpy()
             pred_types = out['type_logits'][0].cpu().numpy().argmax(-1)
-            gt_segs    = gt.cpu().numpy()                    # [T_gt,6]
-            print("pred_segs",pred_segs)
-            # compute start/end points
+            gt_segs    = gt.cpu().numpy()
+            
+            # Compute start/end points
             gt_ends   = gt_segs[:,4:6]; pred_ends = pred_segs[:,4:6]
             gt_starts = np.roll(gt_ends, 1, axis=0);  gt_starts[0]  = gt_ends[-1]
             pr_starts = np.roll(pred_ends, 1, axis=0); pr_starts[0] = pred_ends[-1]
 
-            # plot
+            # Plot
             fig, ax = plt.subplots(figsize=(6,6))
             ax.set_aspect('equal','box')
             ax.set_xlim(-0.05,1.05); ax.set_ylim(-0.05,1.05)
             ax.set_title(f"Sample {i}")
-            ax.add_patch(rect)
 
-            # GT
+            # GT in green
             for seg, st in zip(gt_segs, gt_starts):
                 negs = int((seg[:4]==-1).sum())
                 stype = 0 if negs==4 else 1 if negs==2 else 2
                 curve = render_segment(st, seg, stype, steps=100)
-                ax.plot(curve[:,0], curve[:,1], '-', color='green', lw=2)
+                ax.plot(curve[:,0], curve[:,1], '-', color='green', lw=2, label='GT' if seg is gt_segs[0] else "")
 
-            # Pred
+            # Pred in red
             for seg, st, stype in zip(pred_segs, pr_starts, pred_types):
                 curve = render_segment(st, seg, stype, steps=100)
-                ax.plot(curve[:,0], curve[:,1], '--', color='red', lw=2)
+                ax.plot(curve[:,0], curve[:,1], '--', color='red', lw=2, label='Pred' if seg is pred_segs[0] else "")
 
+            ax.legend()
             plt.tight_layout()
             plt.savefig(os.path.join(vis_dir, f"sample_{i}.png"), dpi=120)
             plt.close(fig)
@@ -1590,9 +1268,10 @@ if __name__ == "__main__":
         model_name="", # Load previous best if exists
         # model_name="bezier_checkpoints/best_model.pth", # Load previous best if exists
         output_dir="bezier_checkpoints",
-        num_epochs=30,
-        learning_rate=5e-3, # Slightly lower LR might be stabler
-        batch_size=5,
+        num_epochs=50,  # Increased epochs
+        learning_rate=1e-3, # Lower learning rate for more stable training
+        batch_size=2,       # Smaller batch size since we only have 5 shapes
+        max_samples=5,      # Use only the 5 simple shapes
         run_visualization=True,
     )
     

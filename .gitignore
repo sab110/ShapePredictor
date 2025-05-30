@@ -1,0 +1,233 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+shape_predictor_env/
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# PyTorch Model Checkpoints and Large Files
+bezier_checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated Results and Visualizations
+evaluation_results/
+vis_epoch_*/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff
+instance/
+.webassets-cache
+
+# Scrapy stuff
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# macOS Thumbnails
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# HuggingFace Cache (can be large)
+.cache/
+transformers_cache/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Dataset files (uncomment if you don't want to track generated data)
+# dataset/
+# *.json
+# *.png
+
+# Backup files
+*.bak
+*.backup
+
+# Editor files
+*.sublime-project
+*.sublime-workspace
+
+# Scientific computing
+.ipynb_checkpoints/
+*.h5
+*.hdf5
+
+# TensorBoard logs (if using)
+runs/
+logs/
+tensorboard_logs/
+
+# Weights & Biases (if using)
+wandb/
+
+# MLflow (if using)
+mlruns/
+
+# DVC (if using)
+.dvc
+.dvcignore
+
+# GPU/CUDA compiled files
+*.cu
+*.ptx
+
+# Configuration files with sensitive data
+config.yaml
+secrets.yaml
+.secrets/
+
+# Ignore compiled extensions
+*.dll
+*.dylib
+*.so 

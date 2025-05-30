@@ -1,0 +1,24 @@
+{
+  "global_style": {
+    "visual_style": "simple geometric",
+    "color_mode": "solid colors",
+    "line_weight": "none",
+    "lighting": "uniform",
+    "camera": "orthographic",
+    "mood": "neutral"
+  },
+  "scene": [
+    {
+      "id": 0,
+      "description": "A white canvas containing a a yellow diamond",
+      "mask_path": "mask_0.png",
+      "parent": -1
+    },
+    {
+      "id": 1,
+      "description": "A yellow diamond",
+      "mask_path": "mask_1.png",
+      "parent": 0
+    }
+  ]
+}
