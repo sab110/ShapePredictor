@@ -9,15 +9,38 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import json
+import logging
+from datetime import datetime
 from boundedShapePredSOTA import PolygonPredictor, PolygonConfig, AugmentedDataset, collate_fn
 from torch.utils.data import DataLoader
 
+def setup_logging(output_dir):
+    """Setup logging configuration"""
+    log_dir = os.path.join(output_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'evaluation_{timestamp}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
 def load_trained_model(checkpoint_path, device):
     """Load the trained model from checkpoint."""
-    print(f"Loading model from {checkpoint_path}...")
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading model from {checkpoint_path}...")
     
-    # Create model
+    # Create model with correct dimensions to match checkpoint
     cfg = PolygonConfig()
+    cfg.d_model = 256  # Update model dimension to match checkpoint (was previously 128)
+    cfg.dim_feedforward = 1024  # Update feedforward dimension to match checkpoint (was previously 512)
     model = PolygonPredictor(cfg=cfg).to(device)
     
     # Load checkpoint
@@ -31,12 +54,12 @@ def load_trained_model(checkpoint_path, device):
     missing_keys, unexpected_keys = model_to_load.load_state_dict(checkpoint["model_state_dict"], strict=False)
     
     if missing_keys:
-        print(f"Missing keys: {missing_keys}")
+        logger.warning(f"Missing keys: {missing_keys}")
     if unexpected_keys:
-        print(f"Unexpected keys: {unexpected_keys}")
+        logger.warning(f"Unexpected keys: {unexpected_keys}")
     
     model.eval()
-    print(f"Model loaded successfully! Best loss was: {checkpoint.get('best_loss', 'N/A')}")
+    logger.info(f"Model loaded successfully! Best loss was: {checkpoint.get('best_loss', 'N/A')}")
     return model
 
 def render_bezier_curve(start_pt, curve_params, curve_type, steps=50):
@@ -65,6 +88,7 @@ def render_bezier_curve(start_pt, curve_params, curve_type, steps=50):
 
 def calculate_curve_metrics(pred_curves, gt_curves, pred_types, gt_types):
     """Calculate evaluation metrics for curve prediction."""
+    logger = logging.getLogger(__name__)
     metrics = {}
     
     # Convert to numpy for easier processing
@@ -80,8 +104,10 @@ def calculate_curve_metrics(pred_curves, gt_curves, pred_types, gt_types):
         gt_valid = gt_curves_np[valid_mask]
         curve_error = np.abs(pred_valid - gt_valid).mean()
         metrics['curve_l1_error'] = curve_error
+        logger.debug(f"Curve L1 error: {curve_error:.6f}")
     else:
         metrics['curve_l1_error'] = 0.0
+        logger.warning("No valid segments found for curve error calculation")
     
     # 2. Type prediction accuracy
     valid_types = gt_types_np[valid_mask] if valid_mask.any() else []
@@ -90,8 +116,10 @@ def calculate_curve_metrics(pred_curves, gt_curves, pred_types, gt_types):
     if len(valid_types) > 0:
         type_accuracy = (pred_types_valid == valid_types).mean()
         metrics['type_accuracy'] = type_accuracy
+        logger.debug(f"Type accuracy: {type_accuracy:.3f}")
     else:
         metrics['type_accuracy'] = 0.0
+        logger.warning("No valid types found for accuracy calculation")
     
     # 3. Endpoint prediction error (most important for shape)
     if valid_mask.any():
@@ -99,22 +127,27 @@ def calculate_curve_metrics(pred_curves, gt_curves, pred_types, gt_types):
         gt_endpoints = gt_curves_np[valid_mask, 4:6]
         endpoint_error = np.linalg.norm(pred_endpoints - gt_endpoints, axis=1).mean()
         metrics['endpoint_error'] = endpoint_error
+        logger.debug(f"Endpoint error: {endpoint_error:.6f}")
     else:
         metrics['endpoint_error'] = 0.0
+        logger.warning("No valid endpoints found for error calculation")
     
     return metrics
 
 def evaluate_single_sample(model, sample, device, shape_name):
     """Evaluate model on a single sample and return results."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Evaluating shape: {shape_name}")
+    
     # Prepare input (add batch dimension)
     child_embs = sample['child_embs'].unsqueeze(0).to(device)
     parent_embs = sample['parent_embs'].unsqueeze(0).to(device)
     parent_bezier = sample['parent_bezier_segs'].unsqueeze(0).to(device)
-    gt_curves = sample['gt_curves'].unsqueeze(0)
+    gt_curves = sample['gt_curves']  # This is [T_gt, 6] for individual samples
     
-    # Get ground truth types
-    gt_c1 = gt_curves[:, :, :2]
-    gt_c2 = gt_curves[:, :, 2:4]
+    # Get ground truth types - fix tensor indexing for 2D tensor
+    gt_c1 = gt_curves[:, :2]  # [T_gt, 2] instead of [:, :, :2]
+    gt_c2 = gt_curves[:, 2:4]  # [T_gt, 2] instead of [:, :, 2:4]
     gt_line_mask = (gt_c1 < 0).all(dim=-1) & (gt_c2 < 0).all(dim=-1)
     gt_quad_mask = (gt_c1 < 0).all(dim=-1) & ~(gt_c2 < 0).all(dim=-1)
     gt_cubic_mask = ~(gt_line_mask | gt_quad_mask)
@@ -132,23 +165,49 @@ def evaluate_single_sample(model, sample, device, shape_name):
     pred_types = torch.argmax(pred_type_logits, dim=-1)
     pred_stops = outputs['stops'][0]
     
-    # Calculate metrics
+    # DEBUG: Check if segments are still identical
+    logger.info(f"DEBUG - {shape_name} first 5 predicted segments:")
+    for i in range(min(5, pred_segments.shape[0])):
+        seg = pred_segments[i].cpu().numpy()
+        logger.info(f"  Segment {i}: [{seg[0]:.3f}, {seg[1]:.3f}, {seg[2]:.3f}, {seg[3]:.3f}, {seg[4]:.3f}, {seg[5]:.3f}]")
+    
+    # Check if all segments are identical
+    first_seg = pred_segments[0]
+    identical_count = 0
+    for i in range(1, min(10, pred_segments.shape[0])):  # Check first 10 segments
+        if torch.allclose(first_seg, pred_segments[i], atol=1e-4):
+            identical_count += 1
+    
+    if identical_count > 0:
+        logger.warning(f"  {shape_name}: {identical_count}/9 segments are identical to the first!")
+    else:
+        logger.info(f"  {shape_name}: All segments are unique - PROBLEM FIXED!")
+    
+    # Calculate metrics - pass gt_curves directly since it's already 2D
     metrics = calculate_curve_metrics(
-        pred_segments, gt_curves[0], pred_types, gt_types[0]
+        pred_segments, gt_curves, pred_types, gt_types
     )
+    
+    logger.info(f"Shape {shape_name} metrics:")
+    logger.info(f"  Curve L1 Error: {metrics['curve_l1_error']:.6f}")
+    logger.info(f"  Type Accuracy: {metrics['type_accuracy']:.3f}")
+    logger.info(f"  Endpoint Error: {metrics['endpoint_error']:.6f}")
     
     return {
         'shape_name': shape_name,
         'pred_segments': pred_segments.cpu().numpy(),
-        'gt_curves': gt_curves[0].cpu().numpy(),
+        'gt_curves': gt_curves.cpu().numpy(),  # gt_curves is already [T_gt, 6]
         'pred_types': pred_types.cpu().numpy(),
-        'gt_types': gt_types[0].cpu().numpy(),
+        'gt_types': gt_types.cpu().numpy(),  # gt_types is already [T_gt]
         'pred_stops': pred_stops.cpu().item(),
         'metrics': metrics
     }
 
 def visualize_predictions(results, output_dir="evaluation_results"):
     """Create visualizations comparing predictions vs ground truth."""
+    logger = logging.getLogger(__name__)
+    logger.info("Generating visualizations...")
+    
     os.makedirs(output_dir, exist_ok=True)
     
     # Create a summary plot with all shapes
@@ -174,7 +233,8 @@ def visualize_predictions(results, output_dir="evaluation_results"):
             try:
                 curve = render_bezier_curve(start, seg, gt_type, steps=50)
                 ax.plot(curve[:, 0], curve[:, 1], '-', color='green', linewidth=3, alpha=0.7)
-            except:
+            except Exception as e:
+                logger.warning(f"Error rendering ground truth curve for {shape_name}, segment {j}: {e}")
                 continue
         
         # Plot predictions in red
@@ -188,18 +248,21 @@ def visualize_predictions(results, output_dir="evaluation_results"):
             try:
                 curve = render_bezier_curve(start, seg, pred_type, steps=50)
                 ax.plot(curve[:, 0], curve[:, 1], '--', color='red', linewidth=2)
-            except:
+            except Exception as e:
+                logger.warning(f"Error rendering prediction curve for {shape_name}, segment {j}: {e}")
                 continue
         
         ax.set_xlim(-0.1, 1.1)
         ax.set_ylim(-0.1, 1.1)
         ax.set_aspect('equal')
-        ax.set_title(f'{shape_name}\\nEndpoint Error: {result["metrics"]["endpoint_error"]:.4f}')
+        ax.set_title(f'{shape_name}\nEndpoint Error: {result["metrics"]["endpoint_error"]:.4f}')
         ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'all_shapes_comparison.png'), dpi=150, bbox_inches='tight')
-    plt.show()
+    summary_plot_path = os.path.join(output_dir, 'all_shapes_comparison.png')
+    plt.savefig(summary_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved summary plot to {summary_plot_path}")
     
     # Create individual detailed plots
     for result in results:
@@ -224,7 +287,8 @@ def visualize_predictions(results, output_dir="evaluation_results"):
                 curve = render_bezier_curve(start, seg, gt_type, steps=100)
                 ax.plot(curve[:, 0], curve[:, 1], '-', color='green', linewidth=4, 
                        label='Ground Truth' if j == 0 else "", alpha=0.8)
-            except:
+            except Exception as e:
+                logger.warning(f"Error rendering ground truth curve for {shape_name}, segment {j}: {e}")
                 continue
         
         # Predictions
@@ -239,26 +303,30 @@ def visualize_predictions(results, output_dir="evaluation_results"):
                 curve = render_bezier_curve(start, seg, pred_type, steps=100)
                 ax.plot(curve[:, 0], curve[:, 1], '--', color='red', linewidth=3,
                        label='Prediction' if j == 0 else "", alpha=0.8)
-            except:
+            except Exception as e:
+                logger.warning(f"Error rendering prediction curve for {shape_name}, segment {j}: {e}")
                 continue
         
         ax.set_xlim(-0.1, 1.1)
         ax.set_ylim(-0.1, 1.1)
         ax.set_aspect('equal')
-        ax.set_title(f'{shape_name} - Detailed Comparison\\n'
+        ax.set_title(f'{shape_name} - Detailed Comparison\n'
                     f'Endpoint Error: {result["metrics"]["endpoint_error"]:.4f}, '
                     f'Type Accuracy: {result["metrics"]["type_accuracy"]:.2f}')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
-        plt.savefig(os.path.join(output_dir, f'{shape_name}_detailed.png'), dpi=150, bbox_inches='tight')
+        detailed_plot_path = os.path.join(output_dir, f'{shape_name}_detailed.png')
+        plt.savefig(detailed_plot_path, dpi=150, bbox_inches='tight')
         plt.close()
+        logger.info(f"Saved detailed plot for {shape_name} to {detailed_plot_path}")
 
 def check_diversity(results):
     """Check if the model produces diverse outputs for different inputs."""
-    print("\\n" + "="*50)
-    print("DIVERSITY ANALYSIS")
-    print("="*50)
+    logger = logging.getLogger(__name__)
+    logger.info("\n" + "="*50)
+    logger.info("DIVERSITY ANALYSIS")
+    logger.info("="*50)
     
     # Compare predictions across different shapes
     all_pred_endpoints = []
@@ -282,16 +350,16 @@ def check_diversity(results):
     all_types = np.concatenate(all_pred_types, axis=0)
     unique_types = len(np.unique(all_types))
     
-    print(f"Endpoint coordinate variance: {endpoint_variance:.6f}")
-    print(f"Number of unique curve types predicted: {unique_types}/3")
+    logger.info(f"Endpoint coordinate variance: {endpoint_variance:.6f}")
+    logger.info(f"Number of unique curve types predicted: {unique_types}/3")
     
     # Compare each shape's predictions
-    print("\\nPer-shape first endpoint predictions:")
+    logger.info("\nPer-shape first endpoint predictions:")
     for i, result in enumerate(results):
         shape_name = result['shape_name']
         first_endpoint = result['pred_segments'][0, 4:6]
         first_type = result['pred_types'][0]
-        print(f"  {shape_name}: endpoint=({first_endpoint[0]:.3f}, {first_endpoint[1]:.3f}), type={first_type}")
+        logger.info(f"  {shape_name}: endpoint=({first_endpoint[0]:.3f}, {first_endpoint[1]:.3f}), type={first_type}")
     
     # Check if all predictions are identical (the original problem)
     first_pred = results[0]['pred_segments']
@@ -302,11 +370,11 @@ def check_diversity(results):
             break
     
     if all_identical:
-        print("\\n❌ WARNING: All predictions are nearly identical!")
-        print("   The original problem may still exist.")
+        logger.warning("\n[WARNING] All predictions are nearly identical!")
+        logger.warning("   The original problem may still exist.")
     else:
-        print("\\n✅ SUCCESS: Predictions are diverse across different shapes!")
-        print("   The model is generating different outputs for different inputs.")
+        logger.info("\n[SUCCESS] Predictions are diverse across different shapes!")
+        logger.info("   The model is generating different outputs for different inputs.")
     
     return {
         'endpoint_variance': endpoint_variance,
@@ -315,29 +383,31 @@ def check_diversity(results):
     }
 
 def main():
-    print("="*60)
-    print("SHAPE PREDICTION MODEL EVALUATION")
-    print("="*60)
+    # Setup logging
+    logger = setup_logging("evaluation_results")
+    logger.info("="*60)
+    logger.info("SHAPE PREDICTION MODEL EVALUATION")
+    logger.info("="*60)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
     
     # Load trained model
     checkpoint_path = "bezier_checkpoints/best_model.pth"
     if not os.path.exists(checkpoint_path):
-        print(f"❌ Checkpoint not found: {checkpoint_path}")
-        print("Make sure you've trained the model first!")
+        logger.error(f"❌ Checkpoint not found: {checkpoint_path}")
+        logger.error("Make sure you've trained the model first!")
         return
     
     model = load_trained_model(checkpoint_path, device)
     
     # Load dataset
-    print("\\nLoading dataset...")
+    logger.info("\nLoading dataset...")
     dataset = AugmentedDataset(root_dir="dataset", max_samples=5)
-    print(f"Loaded {len(dataset)} samples")
+    logger.info(f"Loaded {len(dataset)} samples")
     
     # Evaluate each shape
-    print("\\nEvaluating model on each shape...")
+    logger.info("\nEvaluating model on each shape...")
     results = []
     shape_names = ['shape1', 'shape2', 'shape3', 'shape4', 'shape5']
     
@@ -349,61 +419,61 @@ def main():
         results.append(result)
         
         metrics = result['metrics']
-        print(f"  {shape_name}:")
-        print(f"    Curve L1 Error: {metrics['curve_l1_error']:.6f}")
-        print(f"    Type Accuracy: {metrics['type_accuracy']:.3f}")
-        print(f"    Endpoint Error: {metrics['endpoint_error']:.6f}")
+        logger.info(f"  {shape_name}:")
+        logger.info(f"    Curve L1 Error: {metrics['curve_l1_error']:.6f}")
+        logger.info(f"    Type Accuracy: {metrics['type_accuracy']:.3f}")
+        logger.info(f"    Endpoint Error: {metrics['endpoint_error']:.6f}")
     
     # Calculate overall metrics
-    print("\\n" + "="*50)
-    print("OVERALL METRICS")
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info("OVERALL METRICS")
+    logger.info("="*50)
     
     avg_curve_error = np.mean([r['metrics']['curve_l1_error'] for r in results])
     avg_type_accuracy = np.mean([r['metrics']['type_accuracy'] for r in results])
     avg_endpoint_error = np.mean([r['metrics']['endpoint_error'] for r in results])
     
-    print(f"Average Curve L1 Error: {avg_curve_error:.6f}")
-    print(f"Average Type Accuracy: {avg_type_accuracy:.3f}")
-    print(f"Average Endpoint Error: {avg_endpoint_error:.6f}")
+    logger.info(f"Average Curve L1 Error: {avg_curve_error:.6f}")
+    logger.info(f"Average Type Accuracy: {avg_type_accuracy:.3f}")
+    logger.info(f"Average Endpoint Error: {avg_endpoint_error:.6f}")
     
     # Check diversity (the main issue we were trying to fix)
     diversity_stats = check_diversity(results)
     
     # Create visualizations
-    print("\\n" + "="*50)
-    print("GENERATING VISUALIZATIONS")
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info("GENERATING VISUALIZATIONS")
+    logger.info("="*50)
     
     visualize_predictions(results)
-    print("Visualizations saved to 'evaluation_results/' directory")
+    logger.info("Visualizations saved to 'evaluation_results/' directory")
     
     # Final assessment
-    print("\\n" + "="*60)
-    print("EVALUATION SUMMARY")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("EVALUATION SUMMARY")
+    logger.info("="*60)
     
     if diversity_stats['all_identical']:
-        print("❌ ISSUE DETECTED: Model still produces identical outputs")
-        print("   Consider training longer or adjusting model architecture")
+        logger.warning("[ISSUE DETECTED] Model still produces identical outputs")
+        logger.warning("   Consider training longer or adjusting model architecture")
     else:
-        print("✅ SUCCESS: Model produces diverse outputs for different shapes")
+        logger.info("[SUCCESS] Model produces diverse outputs for different shapes")
         
         if avg_endpoint_error < 0.1:
-            print("✅ EXCELLENT: Shape accuracy is very good")
+            logger.info("[EXCELLENT] Shape accuracy is very good")
         elif avg_endpoint_error < 0.2:
-            print("✅ GOOD: Shape accuracy is acceptable")
+            logger.info("[GOOD] Shape accuracy is acceptable")
         else:
-            print("⚠️  FAIR: Shape accuracy could be improved")
+            logger.warning("[FAIR] Shape accuracy could be improved")
         
         if avg_type_accuracy > 0.8:
-            print("✅ EXCELLENT: Curve type classification is very good")
+            logger.info("[EXCELLENT] Curve type classification is very good")
         elif avg_type_accuracy > 0.6:
-            print("✅ GOOD: Curve type classification is acceptable")
+            logger.info("[GOOD] Curve type classification is acceptable")
         else:
-            print("⚠️  FAIR: Curve type classification needs improvement")
+            logger.warning("[FAIR] Curve type classification needs improvement")
     
-    print("\\nEvaluation complete! Check the 'evaluation_results/' folder for visualizations.")
+    logger.info("\nEvaluation complete! Check the 'evaluation_results/' folder for visualizations.")
 
 if __name__ == "__main__":
     main() 

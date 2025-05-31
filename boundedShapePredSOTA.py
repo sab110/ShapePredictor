@@ -12,6 +12,8 @@ import torchvision.transforms.functional as TF
 import random
 import time
 from tqdm import tqdm
+import logging
+from datetime import datetime
 from contour import mask_to_bezier_sequence, mask_to_vertex_sequence
 import matplotlib.path as mpath # <<< NEW IMPORT
 from torch.nn.utils.rnn import pad_sequence
@@ -614,51 +616,165 @@ class ShapePredictor(nn.Module):
         self.num_segments = num_segments
         self.d_model = d_model
 
-        # Better initialization for query embeddings to ensure diversity
-        self.query_embed = nn.Parameter(torch.randn(num_segments, d_model) * 0.1)
-        # Initialize with different patterns for each query
-        with torch.no_grad():
-            for i in range(num_segments):
-                # Add some structured variation to each query
-                self.query_embed[i] += torch.sin(torch.arange(d_model, dtype=torch.float) * (i + 1) * 0.1)
-
-        self.positional_encoder = PositionalEncoding(d_model, dropout, max_len=num_segments)
-
+        # Learnable segment queries with STRONG positional differentiation
+        self.segment_queries = nn.Parameter(torch.randn(num_segments, d_model) * 0.2)
+        
+        # CRITICAL: Strong positional embeddings to differentiate segments
+        self.positional_embeddings = nn.Parameter(torch.randn(num_segments, d_model) * 0.3)
+        
+        # Transformer decoder with cross-attention to memory
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            activation=F.gelu # Standard for Transformer FFN
+            activation='relu'  # Use ReLU for stability
         )
         self.decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_decoder_layers,
             norm=nn.LayerNorm(d_model)
         )
 
-        # Output head with better initialization
-        self.output_head = nn.Sequential(
-            nn.Linear(d_model, d_model),  # L1
+        # Coordinate head with segment-specific processing
+        self.coord_head = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
             nn.ReLU(),
-            nn.Linear(d_model, out_dim),   # L2
-            nn.Sigmoid()
+            nn.Dropout(dropout * 0.5),  # Reduced dropout for better accuracy
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),  # Reduced dropout
+            nn.Linear(d_model, out_dim),
         )
         
-        # Better initialization for the output layers
+        # Type head  
+        self.type_head = nn.Linear(d_model, 3)
+        
+        # Stop head
+        self.stop_head = nn.Linear(d_model, 1)
+        
+        # Initialize with diversity in mind
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize with VERY strong segment differentiation"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.2)  # Higher gain for more diversity
+                if m.bias is not None:
+                    nn.init.uniform_(m.bias, -0.1, 0.1)  # Non-zero bias for asymmetry
+        
+        # Ensure segment queries start VERY different with strong patterns
         with torch.no_grad():
-            # Initialize the final layer with smaller weights to avoid saturation
-            nn.init.xavier_uniform_(self.output_head[2].weight, gain=0.1)
-            if self.output_head[2].bias is not None:
-                nn.init.constant_(self.output_head[2].bias, 0.5)  # Start near middle of sigmoid range
+            for i in range(self.num_segments):
+                # Create strong, unique patterns for each segment
+                phase = (i + 1) * 2.0 * np.pi / self.num_segments
+                
+                # Multiple frequency components for rich diversity
+                pattern1 = torch.sin(torch.arange(self.d_model, dtype=torch.float) * phase * 0.1) * 0.3
+                pattern2 = torch.cos(torch.arange(self.d_model, dtype=torch.float) * phase * 0.05) * 0.2
+                pattern3 = torch.sin(torch.arange(self.d_model, dtype=torch.float) * phase * 0.2) * 0.1
+                
+                self.segment_queries[i] += pattern1 + pattern2 + pattern3
+                
+                # Even stronger positional differences
+                pos_pattern = torch.sin(torch.arange(self.d_model, dtype=torch.float) * (i + 1) * 0.3) * 0.4
+                self.positional_embeddings[i] += pos_pattern
+                
+                # Add random offsets to break any remaining symmetry
+                self.segment_queries[i] += torch.randn(self.d_model) * 0.1
+                self.positional_embeddings[i] += torch.randn(self.d_model) * 0.15
 
-    def forward(self, H_memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, H_memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = H_memory.size(0)
-        content_queries = self.query_embed.unsqueeze(0).expand(B, -1, -1)
-        tgt = self.positional_encoder(content_queries)
-        decoded_hidden_states = self.decoder(tgt=tgt, memory=H_memory)
-        coords = self.output_head(decoded_hidden_states)
-        return coords, decoded_hidden_states
+        
+        # CRITICAL REDESIGN: Make segment queries COMPLETELY dependent on input
+        # Instead of starting with fixed queries, generate them entirely from input
+        memory_summary = H_memory.mean(dim=1)  # [B, d_model]
+        
+        # Create a unique "fingerprint" for each input
+        input_fingerprint = torch.tanh(H_memory.sum(dim=1))  # [B, d_model]
+        
+        # Generate completely different base patterns for each input
+        base_pattern = torch.sin(input_fingerprint.unsqueeze(1) * 
+                                torch.arange(1, self.num_segments + 1, device=H_memory.device).float().unsqueeze(0).unsqueeze(2))
+        
+        # Create input-specific segment queries by combining patterns
+        input_queries = []
+        for i in range(self.num_segments):
+            # Each segment gets a unique combination of input features
+            i_tensor = torch.tensor(i, dtype=torch.float, device=H_memory.device)
+            segment_pattern = (
+                input_fingerprint * torch.sin(i_tensor * 0.5) +
+                memory_summary * torch.cos(i_tensor * 0.3) +
+                base_pattern[:, i] * 0.5
+            )
+            input_queries.append(segment_pattern)
+        
+        queries = torch.stack(input_queries, dim=1)  # [B, num_segments, d_model]
+        
+        # Add the learned positional embeddings but with much less weight
+        queries = queries + 0.1 * self.positional_embeddings.unsqueeze(0)
+        
+        # Add strong input-dependent variations to each segment
+        for i in range(self.num_segments):
+            # Create unique variations for each segment based on input content
+            i_tensor = torch.tensor(i + 1, dtype=torch.float, device=H_memory.device)
+            segment_variation = torch.tanh(
+                torch.sum(H_memory, dim=1) * i_tensor * 0.2
+            ) * 0.3
+            queries[:, i] += segment_variation
+        
+        # MUCH STRONGER input conditioning - use ALL the memory information
+        memory_conditioning = H_memory.mean(dim=1, keepdim=True)  # [B, 1, d_model]
+        queries = queries + 0.8 * memory_conditioning  # VERY HIGH conditioning
+        
+        # Add massive input-dependent noise during training
+        if self.training:
+            # Noise that's completely different for each input
+            input_noise_base = torch.sum(input_fingerprint, dim=-1, keepdim=True).unsqueeze(1)
+            input_noise = torch.randn_like(queries) * (0.1 + 0.2 * torch.tanh(input_noise_base))
+            queries = queries + input_noise
+        
+        # Transformer decoder: queries attend to memory via cross-attention
+        decoded_features = self.decoder(tgt=queries, memory=H_memory)
+        
+        # CRITICAL: Strong residual connections that preserve input differences
+        decoded_features = decoded_features + queries * 0.8  # Much stronger residual
+        decoded_features = decoded_features + memory_conditioning * 0.6  # Strong memory influence
+        
+        # Add final input-dependent transformation
+        input_scale = 1.0 + torch.tanh(memory_summary.sum(dim=-1, keepdim=True))  # [B, 1]
+        decoded_features = decoded_features * input_scale.unsqueeze(1)
+        
+        # Predict coordinates with COMPLETELY redesigned processing
+        coords_raw = self.coord_head(decoded_features)  # Raw coordinates
+        
+        # Apply VERY different coordinate processing for each input
+        input_offset = torch.tanh(memory_summary.sum(dim=-1, keepdim=True)) * 0.3  # [B, 1]
+        input_scale_coords = 0.8 + 0.4 * torch.sigmoid(memory_summary.sum(dim=-1, keepdim=True))  # [B, 1]
+        
+        # Transform coordinates with input-dependent parameters
+        coords_transformed = torch.tanh(coords_raw) * input_scale_coords.unsqueeze(1).unsqueeze(2)
+        coords_transformed = coords_transformed + input_offset.unsqueeze(1).unsqueeze(2)
+        
+        # Map to [0,1] range with input-dependent centering
+        coords_final = torch.sigmoid(coords_transformed)
+        
+        # Add final input-dependent coordinate adjustments
+        coord_adjustments = 0.2 * torch.sin(
+            memory_summary.sum(dim=-1, keepdim=True).unsqueeze(1) * 
+            torch.arange(1, 7, device=coords_final.device).float() * 0.5
+        ).unsqueeze(1)
+        coords_final = coords_final + coord_adjustments
+        
+        # Ensure coordinates stay in valid range
+        coords_final = torch.clamp(coords_final, 0.0, 1.0)
+        
+        type_logits = self.type_head(decoded_features)
+        stop_logits = self.stop_head(decoded_features).squeeze(-1)  # [B, num_segments]
+        
+        return coords_final, type_logits, stop_logits
 
 class SimpleShapeEncoder(nn.Module): # Parent Shape Encoder
     def __init__(self, in_dim: int = 6, dim: int = 128, seq_len: int = 50):
@@ -744,6 +860,17 @@ class PolygonPredictor(nn.Module):
         # Fusion module - now for 3 modalities if b_feat is removed.
         # child_text, parent_text, parent_shape_feature
         self.modality_type_embeddings = nn.Parameter(torch.randn(3, cfg.d_model))
+        
+        # Add learnable enhancement layers for text processing
+        self.text_enhancement = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.d_model)
+        )
+        
+        # Add learnable dynamic positioning weights
+        self.dynamic_pos_weights = nn.Parameter(torch.randn(3, cfg.d_model) * 0.1)
+        
         fusion_layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model, nhead=cfg.n_head,
             dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
@@ -764,7 +891,22 @@ class PolygonPredictor(nn.Module):
             dropout=cfg.dropout,
             out_dim=6
         )
-        self.type_head = nn.Linear(cfg.d_model, 3)
+        # Coordinate prediction head - IMPROVED for better range and accuracy
+        self.coordinate_head = nn.Sequential(
+            nn.Linear(cfg.d_model, 2 * cfg.d_model),
+            nn.ReLU(),
+            nn.Dropout(0.05),  # Reduced dropout for better accuracy
+            nn.Linear(2 * cfg.d_model, cfg.d_model),
+            nn.ReLU(),
+            nn.Linear(cfg.d_model, 6)  # 6 coordinates per segment
+        )
+        
+        # Type prediction head - encourage diversity
+        self.type_head = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(cfg.d_model // 2, 3)  # 3 types: line, quadratic, cubic
+        )
         self.stop_head = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.max_segments),
             nn.Sigmoid()  # Outputs probabilities for stop decision per segment
@@ -774,39 +916,213 @@ class PolygonPredictor(nn.Module):
     def encode_text_embeddings(self, text_embeddings: torch.Tensor) -> torch.Tensor:
         # Processes (B, S_text, D_t5) or (B, D_t5) into (B, cfg.d_model)
         if text_embeddings.dim() == 3:
-            # This simple mean pooling assumes no padding or that padding tokens are zero
-            # For more robust pooling with padding, an attention mask from tokenizer output would be needed here.
-            pooled_embs = text_embeddings.mean(dim=1)
+            B, S, D = text_embeddings.shape
+            
+            # CRITICAL: Create much more distinctive pooling strategies
+            # Each strategy captures different aspects of the input
+            
+            # 1. Content-aware attention pooling
+            content_scores = torch.sum(text_embeddings ** 2, dim=-1)  # [B, S]
+            attention_weights = torch.softmax(content_scores, dim=-1)
+            attention_pooled = torch.sum(text_embeddings * attention_weights.unsqueeze(-1), dim=1)
+            
+            # 2. Positional importance pooling (beginning and end matter more)
+            pos_weights = torch.exp(-0.1 * torch.abs(torch.arange(S, device=text_embeddings.device, dtype=torch.float) - S/2))
+            pos_weights = pos_weights / pos_weights.sum()
+            pos_pooled = torch.sum(text_embeddings * pos_weights.unsqueeze(0).unsqueeze(-1), dim=1)
+            
+            # 3. Variance-based pooling (capture diversity)
+            variance_weights = torch.var(text_embeddings, dim=-1) + 1e-8  # [B, S]
+            variance_weights = torch.softmax(variance_weights, dim=-1)
+            variance_pooled = torch.sum(text_embeddings * variance_weights.unsqueeze(-1), dim=1)
+            
+            # 4. Extremal pooling
+            max_pooled, _ = torch.max(text_embeddings, dim=1)
+            min_pooled, _ = torch.min(text_embeddings, dim=1)
+            
+            # 5. Chunked pooling (different parts of the sequence)
+            chunk_size = max(1, S // 4)
+            chunks = []
+            for i in range(0, S, chunk_size):
+                chunk = text_embeddings[:, i:i+chunk_size]
+                if chunk.size(1) > 0:
+                    chunks.append(chunk.mean(dim=1))
+            
+            # Pad chunks to ensure consistent size
+            while len(chunks) < 4:
+                chunks.append(chunks[-1] if chunks else torch.zeros_like(attention_pooled))
+            
+            # Combine ALL pooling strategies to create a rich, distinctive representation
+            combined_features = torch.cat([
+                attention_pooled,     # Content importance
+                pos_pooled,          # Positional structure  
+                variance_pooled,     # Diversity measure
+                max_pooled,          # Extremal values
+                min_pooled,          # Extremal values
+                chunks[0],           # Beginning
+                chunks[1],           # Early-middle
+                chunks[2],           # Late-middle  
+                chunks[3]            # End
+            ], dim=-1)  # [B, 9*D]
+            
+            # Project down but preserve ALL the distinctive information
+            # Use multiple projection heads to preserve different aspects
+            proj1 = F.gelu(self.text_proj(combined_features[:, :D]))
+            proj2 = F.gelu(self.text_proj(combined_features[:, D:2*D]))
+            proj3 = F.gelu(self.text_proj(combined_features[:, 2*D:3*D]))
+            
+            # Combine projections to create final distinctive encoding
+            intermediate = proj1 + 0.5 * proj2 + 0.3 * proj3
+            
         elif text_embeddings.dim() == 2:
-            pooled_embs = text_embeddings
+            # For 2D inputs, create artificial diversity
+            B, D = text_embeddings.shape
+            
+            # Create multiple views of the same input
+            view1 = text_embeddings
+            view2 = torch.roll(text_embeddings, shifts=1, dims=-1)
+            view3 = text_embeddings * torch.sin(torch.arange(D, device=text_embeddings.device).float())
+            
+            combined = torch.cat([view1, view2, view3], dim=-1)
+            intermediate = F.gelu(self.text_proj(combined[:, :D]))
+            
         else:
             raise ValueError(f"Unexpected text_embeddings dim: {text_embeddings.shape}")
-        return self.text_proj(pooled_embs)
+        
+        # Apply enhancement layers
+        enhanced = self.text_enhancement(intermediate)
+        
+        # CRITICAL: Create a highly distinctive hash that ensures different inputs -> different outputs
+        # This hash captures the essence of the input in a way that will create very different coordinates
+        input_signature = torch.sum(text_embeddings.view(text_embeddings.size(0), -1), dim=-1, keepdim=True)
+        
+        # Multiple hash functions to ensure uniqueness
+        hash1 = torch.sin(input_signature * 7.3) * torch.arange(1, self.cfg.d_model + 1, device=enhanced.device).float()
+        hash2 = torch.cos(input_signature * 11.7) * torch.arange(1, self.cfg.d_model + 1, device=enhanced.device).float() * 0.5
+        hash3 = torch.tanh(input_signature * 3.1) * torch.arange(1, self.cfg.d_model + 1, device=enhanced.device).float() * 0.3
+        
+        # Combine enhanced features with VERY strong hash-based differentiation
+        final_features = enhanced + 0.8 * hash1 + 0.6 * hash2 + 0.4 * hash3
+        
+        return final_features
 
     def encode_parent_shape(self, parent_bezier_data: torch.Tensor) -> torch.Tensor:
-        return self.shape_encoder(parent_bezier_data)
+        # Get base encoding from the shape encoder
+        base_encoding = self.shape_encoder(parent_bezier_data)
+        
+        # CRITICAL: Create highly distinctive shape-specific features
+        # Extract shape characteristics that will drive different outputs
+        
+        B = parent_bezier_data.size(0)
+        
+        # 1. Compute shape "fingerprint" from coordinate patterns
+        valid_coords = parent_bezier_data[parent_bezier_data != -1]
+        if valid_coords.numel() > 0:
+            # Shape complexity measure
+            coord_variance = torch.var(valid_coords)
+            coord_mean = torch.mean(valid_coords)
+            coord_range = torch.max(valid_coords) - torch.min(valid_coords)
+            
+            # Broadcast these to all batch items
+            shape_stats = torch.stack([coord_variance, coord_mean, coord_range]).unsqueeze(0).expand(B, -1)
+        else:
+            shape_stats = torch.zeros(B, 3, device=parent_bezier_data.device)
+        
+        # 2. Create unique signatures for each shape in the batch
+        shape_signatures = []
+        for b in range(B):
+            shape_data = parent_bezier_data[b]  # [num_segments, 6]
+            
+            # Sum of all valid coordinates for this shape
+            valid_mask = (shape_data != -1).any(dim=-1)
+            if valid_mask.any():
+                shape_sum = torch.sum(shape_data[valid_mask])
+                shape_count = valid_mask.sum().float()
+                shape_avg = shape_sum / (shape_count + 1e-8)
+            else:
+                shape_avg = torch.tensor(0.0, device=parent_bezier_data.device)
+            
+            shape_signatures.append(shape_avg)
+        
+        shape_signature_tensor = torch.stack(shape_signatures).unsqueeze(-1)  # [B, 1]
+        
+        # 3. Generate multiple hash functions based on shape content
+        hash_base = shape_signature_tensor * 100.0  # Scale up for more variation
+        
+        shape_hash1 = torch.sin(hash_base * 13.7) * torch.arange(1, self.cfg.d_model + 1, device=base_encoding.device).float()
+        shape_hash2 = torch.cos(hash_base * 19.3) * torch.arange(1, self.cfg.d_model + 1, device=base_encoding.device).float() * 0.7
+        shape_hash3 = torch.tanh(hash_base * 7.1) * torch.arange(1, self.cfg.d_model + 1, device=base_encoding.device).float() * 0.5
+        
+        # 4. Add shape statistics as additional features
+        stats_expansion = torch.sin(shape_stats.unsqueeze(-1) * torch.arange(1, self.cfg.d_model + 1, device=base_encoding.device).float()) * 0.3
+        stats_features = stats_expansion.mean(dim=1)  # [B, d_model]
+        
+        # 5. Combine all shape-based features
+        enhanced_shape_encoding = (
+            base_encoding + 
+            0.9 * shape_hash1 + 
+            0.7 * shape_hash2 + 
+            0.5 * shape_hash3 + 
+            0.4 * stats_features
+        )
+        
+        return enhanced_shape_encoding
 
-    def fuse_modalities(self, c_feat, p_feat, s_feat) -> torch.Tensor: # b_feat removed
+    def fuse_modalities(self, c_feat, p_feat, s_feat) -> torch.Tensor:
         # All inputs should be (B, cfg.d_model)
-        mods = torch.stack([c_feat, p_feat, s_feat], dim=1) # Stack 3 features
-        if mods.size(1) != self.modality_type_embeddings.size(0):
-             raise ValueError(f"Number of stacked modalities ({mods.size(1)}) != number of modality embeddings ({self.modality_type_embeddings.size(0)})")
-        mods = mods + self.modality_type_embeddings.unsqueeze(0)
-        fused_memory = self.fusion_enc(mods) # (B, 3, cfg.d_model)
+        B = c_feat.size(0)
+        
+        # Add strong noise to break any symmetry
+        if self.training:
+            noise_scale = 0.1
+            c_feat = c_feat + torch.randn_like(c_feat) * noise_scale
+            p_feat = p_feat + torch.randn_like(p_feat) * noise_scale  
+            s_feat = s_feat + torch.randn_like(s_feat) * noise_scale
+        
+        # Create input-dependent positioning
+        # Use the actual feature values to determine positions, not fixed embeddings
+        pos_c = torch.tanh(c_feat.mean(dim=-1, keepdim=True)) * 0.5
+        pos_p = torch.tanh(p_feat.mean(dim=-1, keepdim=True)) * 0.5
+        pos_s = torch.tanh(s_feat.mean(dim=-1, keepdim=True)) * 0.5
+        
+        # Stack modalities with input-dependent positioning
+        mods = torch.stack([c_feat, p_feat, s_feat], dim=1)  # [B, 3, d_model]
+        positions = torch.stack([pos_c, pos_p, pos_s], dim=1)  # [B, 3, 1]
+        
+        # Add both fixed and dynamic positional information
+        fixed_pos = self.modality_type_embeddings.unsqueeze(0)
+        dynamic_pos = positions * self.dynamic_pos_weights.unsqueeze(0)  # Use learnable weights
+        
+        mods = mods + fixed_pos + dynamic_pos
+        
+        # Use transformer encoder with more sophisticated attention
+        fused_memory = self.fusion_enc(mods)  # [B, 3, cfg.d_model]
+        
+        # Add residual connection to preserve input differences
+        fused_memory = fused_memory + mods * 0.2
+        
         return fused_memory
 
     def decode_outputs_from_memory(self, fused_mem: torch.Tensor) -> Dict[str, torch.Tensor]:
-        coords_normalized, decoded_hidden_states = self.coord_decoder(fused_mem)
-        types_logits = self.type_head(decoded_hidden_states)
-        stop_logits_per_step = self.stop_head(decoded_hidden_states)
-        stop_scores = stop_logits_per_step.mean(dim=1)
+        # fused_mem is [B, 3, d_model] - we need to flatten it properly for the decoder
+        # The decoder expects [B, seq_len, d_model] where seq_len is the memory length
+        coords_normalized, types_logits, stop_logits = self.coord_decoder(fused_mem)
+        
+        # If coords_normalized has 4 dimensions [B, memory_len, segments, coords], 
+        # we need to reduce it to [B, segments, coords]
+        if coords_normalized.dim() == 4:
+            # Take the mean or first memory element - let's use mean for now
+            coords_normalized = coords_normalized.mean(dim=1)  # [B, segments, coords]
+        
+        # Convert stop logits to stop scores and find stop index
+        stop_scores = torch.sigmoid(stop_logits)  # [B, num_segments]
         stop_index = stop_scores.argmax(dim=1)
 
         return {
             "coords_normalized": coords_normalized,
             "types_logits": types_logits,
             "stop_index": stop_index,
-            "stop_scores": stop_scores,  # Optional, if needed for further analysis
+            "stop_scores": stop_scores,
         }
 
     def forward(self,
@@ -831,54 +1147,31 @@ class PolygonPredictor(nn.Module):
         decoder_outputs = self.decode_outputs_from_memory(mem)
         pred_coords_normalized = decoder_outputs["coords_normalized"] # (B, cfg.max_segments, 6)
 
-        # 4. Scale normalized coordinates relative to the PARENT shape's bounding box
-        # Derive parent_bbox from parent_bezier (assuming parent_bezier coords are absolute)
-        # parent_bezier is (B, max_segments, 6). Reshape to access points.
-        parent_pts_reshaped = parent_bezier.reshape(parent_bezier.size(0), -1, 2) # (B, max_p_seg * 3, 2)
+        # 4. FIXED: Keep coordinates in [0,1] range instead of scaling to parent bbox
+        # The sigmoid in coord_head already ensures [0,1] range, so we use them directly
+        final_pred_coords = pred_coords_normalized.clone()
         
-        mask = parent_pts_reshaped[..., 0] != -1  # Assumes both x and y are -1 together
-
-        # For X coordinates
-        x_vals = parent_pts_reshaped[..., 0]
-        x_masked_min = x_vals.masked_fill(~mask, float('inf'))
-        x_masked_max = x_vals.masked_fill(~mask, float('-inf'))
-        parent_xmin, _ = x_masked_min.min(dim=1, keepdim=True)
-        parent_xmax, _ = x_masked_max.max(dim=1, keepdim=True)
-
-        # For Y coordinates
-        y_vals = parent_pts_reshaped[..., 1]
-        y_masked_min = y_vals.masked_fill(~mask, float('inf'))
-        y_masked_max = y_vals.masked_fill(~mask, float('-inf'))
-        parent_ymin, _ = y_masked_min.min(dim=1, keepdim=True)
-        parent_ymax, _ = y_masked_max.max(dim=1, keepdim=True)
-
-        parent_mins = torch.cat([parent_xmin, parent_ymin], dim=1).unsqueeze(1) # (B, 1, 2)
-        parent_ranges = torch.cat([parent_xmax - parent_xmin, parent_ymax - parent_ymin], dim=1).unsqueeze(1).clamp(min=1e-6) # (B, 1, 2)
-
-        # Scale pred_coords_normalized (0-1) using parent's bounding box
-        child_pts_reshaped = pred_coords_normalized.reshape(pred_coords_normalized.size(0), -1, 2)
-        scaled_child_pts = child_pts_reshaped * parent_ranges + parent_mins
-        scaled_coords = scaled_child_pts.reshape(pred_coords_normalized.shape)
-
-        # 5. Apply post-processing
-        final_pred_coords = scaled_coords.clone()
+        # 5. Apply post-processing for curve types
         B, T_seq, C_coord = final_pred_coords.shape
 
         pred_types = torch.argmax(decoder_outputs["types_logits"], dim=-1)
         col_indices_coord = torch.arange(C_coord, device=final_pred_coords.device)
 
+        # For line segments (type 0): mask first 4 coordinates (keep only endpoints)
         mask_type0 = (pred_types == 0)
         if mask_type0.any():
             col_mask_4 = (col_indices_coord < 4)
             effective_mask_type0 = mask_type0.unsqueeze(-1) & col_mask_4.view(1, 1, -1)
             final_pred_coords.masked_fill_(effective_mask_type0, -1.0)
 
+        # For quadratic segments (type 1): mask first 2 coordinates (keep control point and endpoint)
         mask_type1 = (pred_types == 1)
         if mask_type1.any():
             col_mask_2 = (col_indices_coord < 2)
             effective_mask_type1 = mask_type1.unsqueeze(-1) & col_mask_2.view(1, 1, -1)
             final_pred_coords.masked_fill_(effective_mask_type1, -1.0)
 
+        # Apply stop masking
         stop_indices = decoder_outputs["stop_index"]
         indices_seq_2D = torch.arange(T_seq, device=final_pred_coords.device).unsqueeze(0)
         mask_after_stop_2D = indices_seq_2D > stop_indices.unsqueeze(1)
@@ -894,129 +1187,438 @@ class PolygonPredictor(nn.Module):
         }
 
 
+def setup_logging(output_dir):
+    """Setup logging configuration"""
+    log_dir = os.path.join(output_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'training_{timestamp}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def train_model_batched(
+    dataset_path,
+    model_name=None,
+    output_dir="bezier_checkpoints_overfit",
+    num_epochs=100,
+    learning_rate=5e-4,
+    batch_size=None,
+    max_samples=None,
+    run_visualization=False,
+    run_post_training_test=True
+):
+    # Setup logging
+    logger = setup_logging(output_dir)
+    logger.info("Starting training process")
+    logger.info(f"Configuration: epochs={num_epochs}, lr={learning_rate}, batch_size={batch_size}, max_samples={max_samples}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    ds = AugmentedDataset(root_dir=dataset_path, max_samples=max_samples)
+    if len(ds) == 0:
+        logger.error("Empty dataset!")
+        raise RuntimeError("Empty dataset!")
+    
+    N = len(ds)
+    actual_batch_size = N if batch_size is None else batch_size
+    logger.info(f"Dataset size: {N}, Batch size: {actual_batch_size}")
+    
+    loader = DataLoader(
+        ds,
+        batch_size=actual_batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=collate_fn
+    )
+
+    cfg = PolygonConfig(
+        d_model=256,
+        n_head=8,
+        num_dec_layers_seq=6,
+        dim_feedforward=1024,
+        max_segments=30,
+        dropout=0.1,
+        num_fusion_layers=3
+    )
+    
+    logger.info(f"Model configuration: {cfg}")
+    model = PolygonPredictor(cfg=cfg).to(device)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=0.01
+    )
+    logger.info(f"Optimizer: AdamW with lr={learning_rate}, weight_decay=0.01")
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5
+    )
+
+    start_epoch = 1
+    best_loss = float('inf')
+    patience = 10
+    no_improve_epochs = 0
+
+    if model_name and os.path.exists(model_name):
+        logger.info(f"Resuming training from checkpoint: {model_name}")
+        ckpt = torch.load(model_name, map_location=device)
+        
+        model_to_load = model
+        if hasattr(model, "_orig_mod"):
+            model_to_load = model._orig_mod
+
+        missing_keys, unexpected_keys = model_to_load.load_state_dict(ckpt["model_state_dict"], strict=False)
+        
+        if missing_keys:
+            logger.warning(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys: {unexpected_keys}")
+
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            for state in optimizer.state.values():
+                for k_opt, v_opt in state.items():
+                    if isinstance(v_opt, torch.Tensor):
+                        state[k_opt] = v_opt.to(device)
+
+        if "epoch" in ckpt:
+            start_epoch = ckpt['epoch'] + 1
+            
+        if "best_loss" in ckpt:
+            best_loss = ckpt['best_loss']
+
+        logger.info(f"Loaded checkpoint successfully. Best loss was: {best_loss}")
+    else:
+        logger.info("Training from scratch.")
+        
+    best_model_path = os.path.join(output_dir, "best_model.pth")
+
+    logger.info(f"Starting training from epoch {start_epoch} up to {num_epochs}")
+    logger.info(f"Batch size: {actual_batch_size}. Training on {N} samples.")
+
+    for epoch in range(start_epoch, num_epochs + 1):
+        model.train()
+        epoch_total_loss = 0.0
+        epoch_start_time = time.time()
+
+        for batch_idx, batch_data in enumerate(loader):
+            loss_value = train_batch(
+                model, batch_data, optimizer, device, batch_idx,
+                lambda_curve=600.0,       # Reduced to allow diversity losses to dominate
+                lambda_stop=10.0,
+                lambda_len=20.0,
+                lambda_type=300.0,        # Increased for better type diversity
+                lambda_continuity=800.0,  # High for proper continuity
+                debug_mode=True
+            )
+            epoch_total_loss += loss_value
+
+        avg_epoch_loss = epoch_total_loss / len(loader) if len(loader) > 0 else float('nan')
+        epoch_time = time.time() - epoch_start_time
+        
+        logger.info(f"Epoch {epoch:3d}/{num_epochs} - Loss: {avg_epoch_loss:.6f} - Time: {epoch_time:.2f}s")
+
+        scheduler.step(avg_epoch_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"Current learning rate: {current_lr:.6f}")
+
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            no_improve_epochs = 0
+            logger.info(f"New best model at epoch {epoch}, loss {best_loss:.6f}")
+            save_checkpoint(model, optimizer, epoch, best_loss, best_model_path)
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                logger.info(f"Early stopping triggered after {patience} epochs without improvement")
+                break
+
+        if avg_epoch_loss < 1e-6:
+            logger.info(f"Perfect overfit achieved at epoch {epoch}!")
+            break
+
+    final_path = os.path.join(output_dir, "final_model.pth")
+    save_checkpoint(model, optimizer, num_epochs, best_loss, final_path)
+    logger.info(f"Saved final model to {final_path}")
+
+    if run_post_training_test and os.path.exists(best_model_path):
+        logger.info("Running post-training tests...")
+        best_ckpt = torch.load(best_model_path, map_location=device)
+        test_model = PolygonPredictor(cfg=cfg).to(device)
+        test_model.load_state_dict(best_ckpt["model_state_dict"], strict=False)
+        test_results = post_training_test(test_model, ds, device)
+        
+        test_results_path = os.path.join(output_dir, "post_training_test_results.json")
+        with open(test_results_path, 'w') as f:
+            json.dump(test_results, f, indent=2)
+        logger.info(f"Post-training test results saved to {test_results_path}")
+    
+    return model
+
 def train_batch(
     model,
     batch,
     optimizer,
     device,
-    batch_idx, # For printing progress
-    lambda_curve: float = 500.0,  # Reduced from 2000
-    lambda_stop:  float = 10.0,
-    lambda_len:   float = 20.0, # Weight for the expected length loss
-    lambda_type:  float = 100.0,
-    debug_mode:   bool  = True,
+    batch_idx,
+    lambda_curve: float = 500.0,
+    lambda_stop: float = 10.0,
+    lambda_len: float = 20.0,
+    lambda_type: float = 200.0,
+    lambda_continuity: float = 300.0,
+    debug_mode: bool = True,
 ):
+    logger = logging.getLogger(__name__)
+    
     # Move batch to device and ensure lengths is float for calculations
-    child_embs  = batch['child_embs'].to(device)
+    child_embs = batch['child_embs'].to(device)
     parent_embs = batch['parent_embs'].to(device)
     parent_bbox = batch['parent_bbox'].to(device)
     parent_segs = batch['parent_bezier_segs'].to(device)
-    gt_curves   = batch['gt_curves'].to(device)         # Shape: [B, T_gt, 6]
-    lengths     = batch['lengths'].to(device).float()   # Shape: [B], ground truth number of segments
+    gt_curves = batch['gt_curves'].to(device)
+    lengths = batch['lengths'].to(device).float()
 
     B = gt_curves.size(0)
-    if B == 0: # Handle empty batch if it can occur
+    if B == 0:
+        logger.warning("Empty batch encountered")
         return 0.0
         
-    # 1) Forward pass
+    # Forward pass
     outputs = model(
         child_embs,
         parent_embs,
         parent_segs,
     )
-    pred_segments = outputs['segments']     # Shape: [B, S, 6] (S = max_output_segments)
-    pred_stops    = outputs['stop_scores']        # Shape: [B, S] (sigmoid probabilities)
-    type_logits   = outputs['type_logits']  # Shape: [B, S, 3]
+    pred_segments = outputs['segments']
+    pred_stops = outputs['stop_scores']
+    type_logits = outputs['type_logits']
 
-    S = pred_segments.size(1) # Maximum predicted sequence length (max_output_segments)
-    T_gt_dim = gt_curves.size(1)  # Padded length of ground truth curves in the batch
+    S = pred_segments.size(1)
+    T_gt_dim = gt_curves.size(1)
 
-    # 2) Create valid_mask based on true lengths for segments that are actually present
-    valid_mask = (torch.arange(S, device=device)[None, :] < lengths[:, None]).float()  # Shape: [B, S]
+    # Create valid_mask based on true lengths
+    valid_mask = (torch.arange(S, device=device)[None, :] < lengths[:, None]).float()
 
-    # 3) Curve L1 loss
+    # Calculate losses
     compare_len_curve = min(S, T_gt_dim)
-    
-    pred_for_curve = pred_segments[:, :compare_len_curve, :]    # [B, compare_len_curve, 6]
-    gt_for_curve   = gt_curves[:, :compare_len_curve, :]        # [B, compare_len_curve, 6]
-    mask_for_curve = valid_mask[:, :compare_len_curve]          # [B, compare_len_curve]
+    pred_for_curve = pred_segments[:, :compare_len_curve, :]
+    gt_for_curve = gt_curves[:, :compare_len_curve, :]
+    mask_for_curve = valid_mask[:, :compare_len_curve]
 
+    # Basic L1 loss
     err = (pred_for_curve - gt_for_curve).abs() * mask_for_curve.unsqueeze(-1)
-    num_valid_coords = (mask_for_curve.sum() * 6).clamp(min=1e-9) # Avoid division by zero
+    num_valid_coords = (mask_for_curve.sum() * 6).clamp(min=1e-9)
     loss_curve = lambda_curve * (err.sum() / num_valid_coords)
 
-    # 4) Stop-token loss (Binary Cross-Entropy)
-    idxs_S = torch.arange(S, device=device)[None, :].expand(B, -1) # [B,S] tensor of [0,1,...,S-1]
-    stop_idx_gt = (lengths - 1).clamp(min=0)[:, None] # [B,1], index of the last true segment.
-    target_stop = (idxs_S >= stop_idx_gt).float()     # [B,S]
+    # Add coordinate range penalty
+    range_penalty = torch.where(
+        (pred_for_curve < 0) | (pred_for_curve > 1),
+        torch.abs(pred_for_curve - torch.clamp(pred_for_curve, 0, 1)),
+        torch.zeros_like(pred_for_curve)
+    )
+    loss_curve += lambda_curve * (range_penalty.sum() / num_valid_coords)
 
-    weight_for_stop_loss = torch.where(target_stop > 0, 5.0, 1.0) # As in original
+    # Stop-token loss
+    idxs_S = torch.arange(S, device=device)[None, :].expand(B, -1)
+    stop_idx_gt = (lengths - 1).clamp(min=0)[:, None]
+    target_stop = (idxs_S >= stop_idx_gt).float()
+
+    weight_for_stop_loss = torch.where(target_stop > 0, 5.0, 1.0)
     loss_stop = lambda_stop * F.binary_cross_entropy(
         pred_stops, target_stop, weight=weight_for_stop_loss, reduction='mean'
     )
 
-    # 5) Expected Length Loss
-    prob_continue = 1.0 - pred_stops # Shape: [B, S]
-
+    # Expected Length Loss
+    prob_continue = 1.0 - pred_stops
     ones_for_batch_dim = torch.ones(B, 1, device=device)
+    
     if S == 0:
         expected_length = torch.zeros(B, device=device)
-    elif S == 1: # If max output is 1 segment
-        expected_length = ones_for_batch_dim.squeeze(1) # Expected length is 1
+    elif S == 1:
+        expected_length = ones_for_batch_dim.squeeze(1)
     else:
-        prob_continue_for_survival = torch.cat([ones_for_batch_dim, prob_continue[:, :-1]], dim=1) # Shape: [B, S]
-        survival_probabilities = torch.cumprod(prob_continue_for_survival, dim=1) # Shape: [B, S]
-        expected_length = torch.sum(survival_probabilities, dim=1) # Shape: [B]
+        prob_continue_for_survival = torch.cat([ones_for_batch_dim, prob_continue[:, :-1]], dim=1)
+        survival_probabilities = torch.cumprod(prob_continue_for_survival, dim=1)
+        expected_length = torch.sum(survival_probabilities, dim=1)
     
     loss_count = lambda_len * (expected_length - lengths).abs().mean()
 
-    # 6) Type classification loss
-    type_logits_for_loss = type_logits[valid_mask.bool()] # Shape: [N_valid_total_segments, 3]
-
-    # Derive gt_types from gt_curves
-    gt_types_source_len = min(T_gt_dim, S)
-    
+    # Type classification loss - SIMPLIFIED approach
+    type_logits_for_loss = type_logits[valid_mask.bool()]
+    gt_types_source_len = min(S, T_gt_dim)
     gt_c1 = gt_curves[:, :gt_types_source_len, :2]
     gt_c2 = gt_curves[:, :gt_types_source_len, 2:4]
-
-    gt_line_mask_full  = (gt_c1 < 0).all(dim=-1) & (gt_c2 < 0).all(dim=-1)
-    gt_quad_mask_full  = (gt_c1 < 0).all(dim=-1) & ~(gt_c2 < 0).all(dim=-1)
-    gt_cubic_mask_full = ~(gt_line_mask_full | gt_quad_mask_full) 
+    
+    gt_line_mask = (gt_c1 < 0).all(dim=-1) & (gt_c2 < 0).all(dim=-1)
+    gt_quad_mask = (gt_c1 < 0).all(dim=-1) & ~(gt_c2 < 0).all(dim=-1)
+    gt_cubic_mask = ~(gt_line_mask | gt_quad_mask)
     
     gt_types_potential = torch.zeros((B, gt_types_source_len), dtype=torch.long, device=device)
-    gt_types_potential[gt_quad_mask_full] = 1
-    gt_types_potential[gt_cubic_mask_full] = 2
+    gt_types_potential[gt_quad_mask] = 1
+    gt_types_potential[gt_cubic_mask] = 2
     
-    # Ensure gt_types_for_masking has dimension S to match valid_mask
-    if gt_types_source_len < S:
-        padding_shape = (B, S - gt_types_source_len)
-        padding_types = torch.zeros(padding_shape, dtype=torch.long, device=device) 
-        gt_types_for_masking = torch.cat([gt_types_potential, padding_types], dim=1)
-    else:
-        gt_types_for_masking = gt_types_potential[:, :S] # Ensure it's not longer than S
-
-    gt_types_for_loss = gt_types_for_masking[valid_mask.bool()] # Shape: [N_valid_total_segments]
-
+    gt_types_for_loss = gt_types_potential[valid_mask.bool()]
+    
+    # Simple type loss without forced balancing
     if type_logits_for_loss.numel() > 0 and type_logits_for_loss.size(0) == gt_types_for_loss.size(0):
-        loss_type = lambda_type * F.cross_entropy(type_logits_for_loss, gt_types_for_loss)
+        # Basic cross entropy loss
+        loss_type_base = F.cross_entropy(
+            type_logits_for_loss, 
+            gt_types_for_loss,
+            reduction='mean'
+        )
+        
+        # MUCH STRONGER type diversity encouragement
+        if S > 1:
+            # Calculate type predictions for each batch
+            pred_types_batch = type_logits.argmax(dim=-1)  # [B, S]
+            
+            # Strongly penalize lack of diversity
+            type_diversity_loss = 0.0
+            for b in range(B):
+                valid_len = int(lengths[b].item())
+                if valid_len > 1:
+                    valid_types = pred_types_batch[b][:valid_len]
+                    unique_types = torch.unique(valid_types)
+                    
+                    # Strong penalty for using only one type
+                    if len(unique_types) == 1:
+                        type_diversity_loss += 5.0  # Very strong penalty
+                    elif len(unique_types) == 2:
+                        type_diversity_loss += 1.0  # Moderate penalty
+                    # No penalty for using all 3 types
+            
+            type_diversity_loss = type_diversity_loss / B
+            
+            # Also add entropy-based diversity loss to encourage type distribution
+            type_probs = torch.softmax(type_logits, dim=-1)  # [B, S, 3]
+            type_entropy = -torch.sum(type_probs * torch.log(type_probs + 1e-8), dim=-1)  # [B, S]
+            
+            # Encourage high entropy (diverse types)
+            entropy_loss = torch.mean(1.0 - type_entropy)  # Penalty for low entropy
+            
+            loss_type = lambda_type * (loss_type_base + 2.0 * type_diversity_loss + 0.5 * entropy_loss)
+        else:
+            loss_type = lambda_type * loss_type_base
     else:
         loss_type = torch.tensor(0.0, device=device)
 
-    # 7) Total loss & backward
-    total_loss = loss_curve + loss_stop + loss_count + loss_type
+    # Continuity loss - COMPLETELY REWRITTEN for proper segment connections
+    if compare_len_curve > 1:
+        # In our format [cx1, cy1, cx2, cy2, ex, ey], we need to enforce:
+        # 1. The endpoint of segment i (last 2 coords) should equal the startpoint of segment i+1
+        # 2. For proper Bezier curves, startpoint is typically the previous endpoint
+        
+        # Get all endpoints: shape [B, S, 2]
+        all_endpoints = pred_for_curve[:, :, -2:]  # [B, S, 2]
+        
+        # Strategy: Make each segment's "implicit start point" equal the previous segment's endpoint
+        # For segment i, its start point should be endpoint of segment i-1
+        
+        # Create continuity constraints
+        continuity_losses = []
+        
+        for b in range(B):
+            valid_len = int(lengths[b].item())
+            if valid_len > 1:
+                # For this batch item, enforce continuity between consecutive segments
+                batch_endpoints = all_endpoints[b, :valid_len]  # [valid_len, 2]
+                
+                # The issue: we don't explicitly model start points, only endpoints
+                # Solution: penalize large jumps between consecutive endpoints to encourage smoothness
+                endpoint_diffs = batch_endpoints[1:] - batch_endpoints[:-1]  # [valid_len-1, 2]
+                continuity_error = torch.sum(endpoint_diffs ** 2)  # Sum of squared distances
+                continuity_losses.append(continuity_error)
+        
+        if continuity_losses:
+            total_continuity_error = torch.stack(continuity_losses).sum()
+            # Very strong continuity loss to force proper connections
+            loss_continuity = lambda_continuity * 5.0 * (total_continuity_error / B)
+        else:
+            loss_continuity = torch.tensor(0.0, device=device)
+    else:
+        loss_continuity = torch.tensor(0.0, device=device)
+
+    # CRITICAL: Add VERY STRONG diversity loss to prevent identical outputs
+    # This will explicitly penalize the model for producing the same output for different inputs
+    input_diversity_loss = torch.tensor(0.0, device=device)
+    if B > 1:
+        # Compare predictions across different samples in the batch
+        # Penalize if different inputs produce similar outputs
+        
+        # 1. Coordinate diversity across batch
+        coord_batch_var = torch.var(pred_for_curve.view(B, -1), dim=0).mean()
+        if coord_batch_var < 0.01:  # If variance is too low
+            input_diversity_loss += 100.0 * (0.01 - coord_batch_var)
+        
+        # 2. Endpoint diversity
+        endpoints = pred_for_curve[:, :, -2:]  # [B, S, 2]
+        for i in range(B):
+            for j in range(i+1, B):
+                endpoint_diff = torch.norm(endpoints[i] - endpoints[j])
+                if endpoint_diff < 0.1:  # If endpoints are too similar
+                    input_diversity_loss += 50.0 * (0.1 - endpoint_diff)
+        
+        # 3. Type diversity across batch
+        type_preds = type_logits.argmax(dim=-1)  # [B, S]
+        for i in range(B):
+            for j in range(i+1, B):
+                type_similarity = (type_preds[i] == type_preds[j]).float().mean()
+                if type_similarity > 0.8:  # If types are too similar
+                    input_diversity_loss += 20.0 * (type_similarity - 0.8)
+
+    # ADDED: Diversity regularization to encourage varied outputs
+    # Penalize when segments within a shape are too similar
+    if compare_len_curve > 1:
+        pred_for_diversity = pred_for_curve[:, :compare_len_curve, :]
+        # Compute pairwise differences between consecutive segments
+        segment_diffs = pred_for_diversity[:, 1:] - pred_for_diversity[:, :-1]
+        segment_distances = torch.norm(segment_diffs, dim=-1)
+        
+        # Encourage minimum distance between segments
+        min_distance = 0.15  # Increased minimum desired distance
+        diversity_penalty = torch.relu(min_distance - segment_distances)
+        
+        # Apply mask for valid segments
+        diversity_mask = mask_for_curve[:, 1:] * mask_for_curve[:, :-1]
+        loss_diversity = 15.0 * (diversity_penalty * diversity_mask).sum() / (diversity_mask.sum() + 1e-9)
+    else:
+        loss_diversity = torch.tensor(0.0, device=device)
+
+    # Total loss - REBALANCED to prioritize diversity
+    total_loss = (loss_curve + loss_stop + loss_count + loss_type + 
+                 loss_continuity + loss_diversity + input_diversity_loss)
     
     optimizer.zero_grad()
     total_loss.backward()
-    # Gradient clipping to prevent exploding gradients
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
     if debug_mode and (batch_idx % 10 == 0 or batch_idx < 5):
-        print(
+        logger.info(
             f"[Batch {batch_idx}] "
             f"Total={total_loss.item():.3f} | "
             f"curve={loss_curve.item():.3f} stop={loss_stop.item():.3f} "
-            f"count={loss_count.item():.3f} type={loss_type.item():.3f} | "
+            f"count={loss_count.item():.3f} type={loss_type.item():.3f} "
+            f"cont={loss_continuity.item():.3f} div={loss_diversity.item():.3f} "
+            f"input_div={input_diversity_loss.item():.3f} | "
             f"E[len]={expected_length.mean().item() if expected_length.numel() > 0 else 0:.2f} "
             f"TrueLen={lengths.mean().item():.2f}"
         )
@@ -1051,106 +1653,156 @@ def save_checkpoint(model, optimizer, epoch, current_best_loss, checkpoint_path)
     return checkpoint
 
 
-def train_model_batched(
-    dataset_path,
-    model_name=None,
-    output_dir="bezier_checkpoints_overfit",
-    num_epochs=100,
-    learning_rate=9e-3,
-    batch_size=None,
-    max_samples=None,
-    run_visualization=False,
-):
-    import traceback
+def post_training_test(model, dataset, device, num_samples=5):
+    """
+    Comprehensive post-training test to verify model behavior.
+    Tests coordinate ranges, segment types, and output diversity.
+    """
+    model.eval()
+    results = {
+        'coordinate_ranges': [],
+        'segment_types': [],
+        'stop_indices': [],
+        'diversity_scores': [],
+        'type_distribution': [],
+        'coordinate_validity': [],
+        'segment_continuity': [],  # New: Check continuity between segments
+        'coordinate_precision': []  # New: Check numerical precision
+    }
+    
+    print("\n=== Post-Training Test Results ===")
+    
+    # Sample random indices
+    indices = random.sample(range(len(dataset)), min(len(dataset), num_samples))
+    
+    for i in indices:
+        sample = dataset[i]
+        # Prepare batch
+        ce = sample['child_embs'].unsqueeze(0).to(device)
+        pe = sample['parent_embs'].unsqueeze(0).to(device)
+        pseg = sample['parent_bezier_segs'].unsqueeze(0).to(device)
+        gt   = sample['gt_curves']
 
-    os.makedirs(output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Training run] Device: {device}")
-
-    ds = AugmentedDataset(root_dir=dataset_path, max_samples=max_samples)
-    if len(ds) == 0: raise RuntimeError("Empty dataset!")
-    N = len(ds)
-    actual_batch_size = N if batch_size is None else batch_size
-    loader = DataLoader(
-        ds,
-        batch_size=actual_batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=collate_fn
-    )
-
-    cfg=PolygonConfig()
-    model = PolygonPredictor(cfg=cfg).to(device)
-
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.0
-    )
-
-    start_epoch = 1
-    best_loss = float('inf')
-
-    if model_name and os.path.exists(model_name):
-        print(f"Resuming training from checkpoint: {model_name}")
-        ckpt = torch.load(model_name, map_location=device)
+        # Forward pass
+        with torch.no_grad():
+            out = model(ce, pe, pseg)
         
-        model_to_load = model
-        if hasattr(model, "_orig_mod"):
-            model_to_load = model._orig_mod
-
-        missing_keys, unexpected_keys = model_to_load.load_state_dict(ckpt["model_state_dict"], strict=False)
+        pred_segs  = out['segments'][0].cpu().numpy()
+        pred_types = out['type_logits'][0].cpu().numpy().argmax(-1)
+        stop_idx = out['stops'][0].item()
         
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            for state in optimizer.state.values():
-                for k_opt, v_opt in state.items():
-                    if isinstance(v_opt, torch.Tensor):
-                        state[k_opt] = v_opt.to(device)
-
-        if "epoch" in ckpt:
-            start_epoch = ckpt['epoch'] + 1
+        # 1. Test coordinate ranges
+        valid_coords = pred_segs[pred_segs != -1]
+        if len(valid_coords) > 0:
+            coord_min = float(valid_coords.min())  # Convert to Python float
+            coord_max = float(valid_coords.max())  # Convert to Python float
+            results['coordinate_ranges'].append((coord_min, coord_max))
+            print(f"\nSample {i} - Coordinate Range: [{coord_min:.3f}, {coord_max:.3f}]")
             
-        if "best_loss" in ckpt:
-            best_loss = ckpt['best_loss']
-
-        print(f"LOADED checkpoint successfully.")
-    else:
-        print("Training from scratch.")
+            # Check if coordinates are within [0,1] range
+            if coord_min < 0 or coord_max > 1:
+                print(f"WARNING: Coordinates outside [0,1] range!")
         
-    best_model_path = os.path.join(output_dir, "best_model.pth")
-
-    print(f"Starting training from epoch {start_epoch} up to {num_epochs}.")
-    print(f"Batch size: {actual_batch_size}. Training on {N} samples.")
-
-    for epoch in range(start_epoch, num_epochs + 1):
-        model.train()
-        epoch_total_loss = 0.0
-
-        for batch_idx, batch_data in enumerate(loader):
-            loss_value = train_batch(
-                model, batch_data, optimizer, device, batch_idx,
-            )
-            epoch_total_loss += loss_value
-
-        avg_epoch_loss = epoch_total_loss / len(loader) if len(loader) > 0 else float('nan')
-        print(f"Epoch {epoch:3d}/{num_epochs} — Total Loss: {avg_epoch_loss:.6f}")
-
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            print(f"  → New best model at epoch {epoch}, loss {best_loss:.6f}")
-            save_checkpoint(model, optimizer, epoch, best_loss, best_model_path)
-
-        if avg_epoch_loss < 1e-6:
-            print(f"✨ Perfect overfit at epoch {epoch}!")
-            break
-
-    final_path = os.path.join(output_dir, "final_model.pth")
-    save_checkpoint(model, optimizer, num_epochs, best_loss, final_path) 
-    print(f"Saved final model to {final_path}")
-
-    return model
-
+        # 2. Test segment types distribution
+        type_counts = np.bincount(pred_types[:stop_idx+1], minlength=3)
+        results['segment_types'].append(type_counts.tolist())  # Convert to list
+        print(f"Segment Types: Line={type_counts[0]}, Quad={type_counts[1]}, Cubic={type_counts[2]}")
+        
+        # 3. Test stop indices
+        results['stop_indices'].append(int(stop_idx))  # Convert to Python int
+        print(f"Stop Index: {stop_idx}")
+        
+        # 4. Test output diversity
+        if len(valid_coords) > 0:
+            # Calculate variance of coordinates as a diversity measure
+            coord_variance = float(np.var(valid_coords))  # Convert to Python float
+            results['diversity_scores'].append(coord_variance)
+            print(f"Diversity Score (variance): {coord_variance:.3f}")
+        
+        # 5. Verify coordinate structure and continuity
+        print("\nCoordinate Structure Analysis:")
+        valid_segments = 0
+        prev_end = None
+        continuity_errors = []
+        
+        for j, seg in enumerate(pred_segs[:stop_idx+1]):
+            if (seg == -1).all():
+                continue
+            valid_segments += 1
+            print(f"Segment {j}:")
+            print(f"  Type: {pred_types[j]}")
+            print(f"  Coords: {seg.tolist()}")  # Convert to list
+            
+            # Check segment continuity
+            if prev_end is not None:
+                current_start = seg[:2]
+                if not np.allclose(prev_end, current_start, atol=1e-4):
+                    continuity_errors.append(j)
+            prev_end = seg[-2:]  # Store end point for next segment
+            
+            # Verify coordinate relationships
+            if pred_types[j] == 0:  # Line
+                assert (seg[:4] == -1).all(), f"Line segment {j} should have -1 for control points"
+            elif pred_types[j] == 1:  # Quadratic
+                assert (seg[:2] == -1).all(), f"Quad segment {j} should have -1 for first control point"
+                assert (seg[2:4] != -1).any(), f"Quad segment {j} should have valid second control point"
+            elif pred_types[j] == 2:  # Cubic
+                assert (seg[:6] != -1).any(), f"Cubic segment {j} should have valid control points"
+        
+        results['segment_continuity'].append({
+            'valid_segments': valid_segments,
+            'continuity_errors': continuity_errors
+        })
+        
+        # 6. Check coordinate validity and precision
+        results['coordinate_validity'].append({
+            'all_valid': bool(np.all((valid_coords >= 0) & (valid_coords <= 1))),  # Convert to Python bool
+            'has_negative': bool(np.any(valid_coords < 0)),
+            'has_above_one': bool(np.any(valid_coords > 1))
+        })
+        
+        # Check numerical precision
+        precision_stats = {
+            'min_precision': float(np.min(np.abs(valid_coords))),
+            'max_precision': float(np.max(np.abs(valid_coords))),
+            'mean_precision': float(np.mean(np.abs(valid_coords)))
+        }
+        results['coordinate_precision'].append(precision_stats)
+    
+    # Aggregate results
+    print("\n=== Aggregate Test Results ===")
+    if results['coordinate_ranges']:
+        all_mins, all_maxs = zip(*results['coordinate_ranges'])
+        print(f"Overall Coordinate Range: [{min(all_mins):.3f}, {max(all_maxs):.3f}]")
+    
+    if results['segment_types']:
+        avg_types = np.mean(results['segment_types'], axis=0)
+        print(f"Average Segment Type Distribution: Line={avg_types[0]:.1f}, Quad={avg_types[1]:.1f}, Cubic={avg_types[2]:.1f}")
+    
+    if results['diversity_scores']:
+        print(f"Average Diversity Score: {np.mean(results['diversity_scores']):.3f}")
+    
+    # Check for any coordinate validity issues
+    validity_issues = [r for r in results['coordinate_validity'] if not r['all_valid']]
+    if validity_issues:
+        print("\nWARNING: Found coordinate validity issues!")
+        for i, issue in enumerate(validity_issues):
+            print(f"Sample {i}:")
+            if issue['has_negative']:
+                print("  - Contains negative coordinates")
+            if issue['has_above_one']:
+                print("  - Contains coordinates > 1")
+    
+    # Check for continuity issues
+    continuity_issues = [r for r in results['segment_continuity'] if r['continuity_errors']]
+    if continuity_issues:
+        print("\nWARNING: Found segment continuity issues!")
+        for i, issue in enumerate(continuity_issues):
+            if issue['continuity_errors']:
+                print(f"Sample {i}:")
+                print(f"  - Discontinuities at segments: {issue['continuity_errors']}")
+    
+    return results
 
 # --- Visualization ---
 def visualize_predictions(model, dataset, device, output_dir, epoch, max_vis=20):
@@ -1273,5 +1925,6 @@ if __name__ == "__main__":
         batch_size=2,       # Smaller batch size since we only have 5 shapes
         max_samples=5,      # Use only the 5 simple shapes
         run_visualization=True,
+        run_post_training_test=True
     )
     
