@@ -231,3 +231,6 @@ secrets.yaml
 *.dll
 *.dylib
 *.so 
+
+modeltrain.py
+model-copy.py

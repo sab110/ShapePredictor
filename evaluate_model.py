@@ -163,8 +163,85 @@ def evaluate_single_sample(model, sample, device, shape_name):
     pred_segments = outputs['segments'][0]  # Remove batch dimension
     pred_type_logits = outputs['type_logits'][0]
     pred_types = torch.argmax(pred_type_logits, dim=-1)
-    pred_stops = outputs['stops'][0]
     
+    # Fix: Use the correct key names from the model output
+    pred_stops = outputs['stop_index'][0]  # Changed from 'stops' to 'stop_index'
+    pred_stop_scores = outputs.get('stop_scores', [None])[0] if 'stop_scores' in outputs else None
+    
+    # === ENHANCED DEBUGGING OUTPUT ===
+    logger.info(f"\n=== DETAILED DEBUG INFO FOR {shape_name.upper()} ===")
+    
+    # 1. STOP PREDICTIONS
+    logger.info(f"STOP PREDICTIONS:")
+    logger.info(f"  Stop Index: {pred_stops.item()}")
+    if pred_stop_scores is not None:
+        stop_scores_np = pred_stop_scores.cpu().numpy()
+        logger.info(f"  Stop Scores (first 10): {stop_scores_np[:10]}")
+        logger.info(f"  Stop Probabilities (first 10): {stop_scores_np[:10]}")
+        logger.info(f"  Max Stop Score: {stop_scores_np.max():.4f} at position {stop_scores_np.argmax()}")
+    
+    # 2. PREDICTED SEGMENTS (ALL VALID ONES)
+    valid_segments = min(pred_stops.item() + 5, pred_segments.shape[0])  # Show a few extra
+    logger.info(f"\nPREDICTED SEGMENTS (showing first {valid_segments}):")
+    for i in range(valid_segments):
+        seg = pred_segments[i].cpu().numpy()
+        seg_type = pred_types[i].cpu().numpy().item()  # Extract scalar value
+        type_names = {0: "Line", 1: "Quad", 2: "Cubic"}
+        
+        # Check if segment is valid (not all -1)
+        is_valid = not (seg == -1).all()
+        validity = "VALID" if is_valid else "MASKED"
+        
+        logger.info(f"  Segment {i:2d}: [{seg[0]:7.3f}, {seg[1]:7.3f}, {seg[2]:7.3f}, {seg[3]:7.3f}, {seg[4]:7.3f}, {seg[5]:7.3f}] | Type: {type_names[seg_type]} ({seg_type}) | {validity}")
+        
+        if i == pred_stops.item():
+            logger.info(f"  ^^^^^^^^^^ STOP INDEX {pred_stops.item()} ^^^^^^^^^^")
+    
+    # 3. TYPE PREDICTIONS ANALYSIS
+    logger.info(f"\nTYPE PREDICTIONS ANALYSIS:")
+    type_counts = {0: 0, 1: 0, 2: 0}
+    valid_type_counts = {0: 0, 1: 0, 2: 0}
+    
+    for i in range(valid_segments):
+        seg = pred_segments[i].cpu().numpy()
+        seg_type = pred_types[i].cpu().numpy().item()  # Extract scalar value
+        type_counts[seg_type] += 1
+        
+        if not (seg == -1).all():  # Only count valid segments
+            valid_type_counts[seg_type] += 1
+    
+    logger.info(f"  Total Type Distribution: Line={type_counts[0]}, Quad={type_counts[1]}, Cubic={type_counts[2]}")
+    logger.info(f"  Valid Type Distribution: Line={valid_type_counts[0]}, Quad={valid_type_counts[1]}, Cubic={valid_type_counts[2]}")
+    
+    # 4. TYPE PREDICTION CONFIDENCE
+    logger.info(f"\nTYPE PREDICTION CONFIDENCE (first {min(10, valid_segments)}):")
+    for i in range(min(10, valid_segments)):
+        type_probs = torch.softmax(pred_type_logits[i], dim=0).cpu().numpy()
+        pred_type = pred_types[i].cpu().numpy().item()  # Extract scalar value
+        confidence = type_probs[pred_type]
+        logger.info(f"  Segment {i}: Predicted={pred_type} | Confidence={confidence:.3f} | Probs=[{type_probs[0]:.3f}, {type_probs[1]:.3f}, {type_probs[2]:.3f}]")
+    
+    # 5. GROUND TRUTH COMPARISON
+    logger.info(f"\nGROUND TRUTH COMPARISON:")
+    gt_type_counts = {0: 0, 1: 0, 2: 0}
+    valid_gt_segments = (gt_curves != -1).any(dim=-1).sum().item()
+    
+    for i in range(min(gt_types.shape[0], 10)):
+        gt_seg = gt_curves[i].cpu().numpy()
+        gt_type = gt_types[i].cpu().numpy().item()  # Extract scalar value
+        is_valid = not (gt_seg == -1).all()
+        
+        if is_valid:
+            gt_type_counts[gt_type] += 1
+            
+        logger.info(f"  GT Seg {i:2d}: [{gt_seg[0]:7.3f}, {gt_seg[1]:7.3f}, {gt_seg[2]:7.3f}, {gt_seg[3]:7.3f}, {gt_seg[4]:7.3f}, {gt_seg[5]:7.3f}] | Type: {gt_type}")
+    
+    logger.info(f"  GT Type Distribution: Line={gt_type_counts[0]}, Quad={gt_type_counts[1]}, Cubic={gt_type_counts[2]}")
+    logger.info(f"  GT Valid Segments: {valid_gt_segments}")
+    
+    logger.info(f"=== END DEBUG INFO FOR {shape_name.upper()} ===\n")
+    
+    # === EXISTING CHECKS ===
     # DEBUG: Check if segments are still identical
     logger.info(f"DEBUG - {shape_name} first 5 predicted segments:")
     for i in range(min(5, pred_segments.shape[0])):
@@ -198,8 +275,9 @@ def evaluate_single_sample(model, sample, device, shape_name):
         'pred_segments': pred_segments.cpu().numpy(),
         'gt_curves': gt_curves.cpu().numpy(),  # gt_curves is already [T_gt, 6]
         'pred_types': pred_types.cpu().numpy(),
-        'gt_types': gt_types.cpu().numpy(),  # gt_types is already [T_gt]
-        'pred_stops': pred_stops.cpu().item(),
+        'gt_types': gt_types.cpu().numpy(),
+        'pred_stops': pred_stops.cpu().numpy(),
+        'pred_stop_scores': pred_stop_scores.cpu().numpy() if pred_stop_scores is not None else None,
         'metrics': metrics
     }
 
@@ -439,6 +517,115 @@ def main():
     
     # Check diversity (the main issue we were trying to fix)
     diversity_stats = check_diversity(results)
+    
+    # === ADD COMPREHENSIVE DEBUGGING SUMMARY ===
+    logger.info("\n" + "="*60)
+    logger.info("COMPREHENSIVE DEBUGGING SUMMARY")
+    logger.info("="*60)
+    
+    # 1. STOP PREDICTION SUMMARY
+    logger.info("\n1. STOP PREDICTION ANALYSIS:")
+    stop_indices = [r['pred_stops'].item() if hasattr(r['pred_stops'], 'item') else r['pred_stops'] for r in results]
+    logger.info(f"   Stop indices: {stop_indices}")
+    logger.info(f"   Average stop index: {np.mean(stop_indices):.1f}")
+    logger.info(f"   Stop index range: {min(stop_indices)} - {max(stop_indices)}")
+    
+    # 2. SEGMENT COORDINATE ANALYSIS
+    logger.info("\n2. SEGMENT COORDINATE ANALYSIS:")
+    all_first_segs = [r['pred_segments'][0] for r in results]
+    all_coords = np.array(all_first_segs)
+    
+    coord_means = np.mean(all_coords, axis=0)
+    coord_vars = np.var(all_coords, axis=0)
+    
+    logger.info(f"   First segment coordinate means: [{coord_means[0]:.3f}, {coord_means[1]:.3f}, {coord_means[2]:.3f}, {coord_means[3]:.3f}, {coord_means[4]:.3f}, {coord_means[5]:.3f}]")
+    logger.info(f"   First segment coordinate vars:  [{coord_vars[0]:.4f}, {coord_vars[1]:.4f}, {coord_vars[2]:.4f}, {coord_vars[3]:.4f}, {coord_vars[4]:.4f}, {coord_vars[5]:.4f}]")
+    logger.info(f"   Average coordinate variance: {np.mean(coord_vars):.4f}")
+    
+    if np.mean(coord_vars) < 0.001:
+        logger.warning("   [WARNING] Very low coordinate variance - segments may be too similar!")
+    else:
+        logger.info("   [SUCCESS] Good coordinate variance - segments are diverse!")
+    
+    # 3. TYPE PREDICTION SUMMARY
+    logger.info("\n3. TYPE PREDICTION ANALYSIS:")
+    all_type_distributions = {}
+    
+    for i, result in enumerate(results):
+        shape_name = result['shape_name']
+        pred_types = result['pred_types']
+        valid_length = min(stop_indices[i] + 1, len(pred_types))
+        
+        type_counts = {0: 0, 1: 0, 2: 0}
+        for j in range(valid_length):
+            pred_type_scalar = pred_types[j].item() if hasattr(pred_types[j], 'item') else pred_types[j]  # Handle both tensor and numpy
+            type_counts[pred_type_scalar] += 1
+        
+        all_type_distributions[shape_name] = type_counts
+        logger.info(f"   {shape_name}: Line={type_counts[0]}, Quad={type_counts[1]}, Cubic={type_counts[2]}")
+    
+    # Overall type statistics
+    total_types = {0: 0, 1: 0, 2: 0}
+    for dist in all_type_distributions.values():
+        for t, count in dist.items():
+            total_types[t] += count
+    
+    total_segs = sum(total_types.values())
+    type_percentages = {t: (count/total_segs)*100 if total_segs > 0 else 0 for t, count in total_types.items()}
+    
+    logger.info(f"   Overall type distribution: Line={type_percentages[0]:.1f}%, Quad={type_percentages[1]:.1f}%, Cubic={type_percentages[2]:.1f}%")
+    
+    if type_percentages[2] > 90:
+        logger.warning("   [WARNING] Model heavily biased toward cubic curves!")
+    elif min(type_percentages.values()) < 5:
+        logger.warning("   [WARNING] Some curve types are rarely predicted!")
+    else:
+        logger.info("   [SUCCESS] Good type diversity across predictions!")
+    
+    # 4. COORDINATE RANGE ANALYSIS
+    logger.info("\n4. COORDINATE RANGE ANALYSIS:")
+    all_valid_coords = []
+    for result in results:
+        segs = result['pred_segments']
+        valid_segs = segs[~(segs == -1).all(axis=1)]  # Remove masked segments
+        if len(valid_segs) > 0:
+            all_valid_coords.extend(valid_segs.flatten())
+    
+    if all_valid_coords:
+        coord_min = min(all_valid_coords)
+        coord_max = max(all_valid_coords)
+        coord_range = coord_max - coord_min
+        
+        logger.info(f"   Coordinate range: [{coord_min:.3f}, {coord_max:.3f}] (span: {coord_range:.3f})")
+        
+        if coord_range < 0.1:
+            logger.warning("   [WARNING] Very narrow coordinate range - shapes may be too constrained!")
+        elif coord_range > 0.8:
+            logger.info("   [SUCCESS] Good coordinate range - shapes can be diverse!")
+        else:
+            logger.info("   [MODERATE] Reasonable coordinate range.")
+    
+    # 5. IDENTICAL SEGMENTS CHECK
+    logger.info("\n5. IDENTICAL SEGMENTS CHECK:")
+    for result in results:
+        shape_name = result['shape_name']
+        segs = result['pred_segments']
+        stop_idx = result['pred_stops'].item() if hasattr(result['pred_stops'], 'item') else result['pred_stops']
+        
+        # Check first few segments for similarity
+        identical_pairs = 0
+        total_pairs = 0
+        
+        for i in range(min(5, len(segs))):
+            for j in range(i+1, min(5, len(segs))):
+                total_pairs += 1
+                if np.allclose(segs[i], segs[j], atol=1e-3):
+                    identical_pairs += 1
+        
+        similarity_pct = (identical_pairs / total_pairs * 100) if total_pairs > 0 else 0
+        logger.info(f"   {shape_name}: {identical_pairs}/{total_pairs} segment pairs are identical ({similarity_pct:.1f}%)")
+    
+    logger.info("="*60)
     
     # Create visualizations
     logger.info("\n" + "="*50)
